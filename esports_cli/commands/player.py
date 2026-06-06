@@ -9,6 +9,9 @@ from esports_cli.utils import (
     print_error,
     print_info,
     print_panel,
+    normalize_player_status,
+    get_player_status_label,
+    is_player_available,
 )
 
 
@@ -21,10 +24,11 @@ def player_cmd():
 @player_cmd.command("list")
 @click.option("--team", "-t", help="队伍ID")
 @click.option("--role", "-r", help="角色筛选")
-@click.option("--status", "-s", help="状态: active/injured/suspended/benched")
+@click.option("--status", "-s", help="状态: active/substitute/suspended/injured/free_agent (兼容旧值 benched)")
 @click.option("--nation", "-n", help="国籍筛选")
+@click.option("--available-only", is_flag=True, help="只显示可出场选手（正常+替补）")
 @pass_context
-def player_list(ctx, team, role, status, nation):
+def player_list(ctx, team, role, status, nation, available_only):
     """查看选手列表"""
     players = ctx.db.load_players()
     teams = {t["id"]: t for t in ctx.db.load_teams()}
@@ -38,7 +42,11 @@ def player_list(ctx, team, role, status, nation):
         filtered = [p for p in filtered if p.get("role", "").lower() == role.lower()]
 
     if status:
-        filtered = [p for p in filtered if p.get("status", "") == status]
+        status_norm = normalize_player_status(status)
+        filtered = [p for p in filtered if normalize_player_status(p.get("status", "")) == status_norm]
+
+    if available_only:
+        filtered = [p for p in filtered if is_player_available(p.get("status", "active"))]
 
     if nation:
         filtered = [p for p in filtered if p.get("nationality", "").lower() == nation.lower()]
@@ -47,27 +55,17 @@ def player_list(ctx, team, role, status, nation):
         print_info("暂无选手数据")
         return
 
-    status_map = {
-        "active": "活跃",
-        "injured": "受伤",
-        "suspended": "禁赛",
-        "benched": "替补",
-        "free_agent": "自由人",
-    }
-
     rows = []
     for p in filtered:
         team_name = teams.get(p.get("team_id", ""), {}).get("name", "自由人")
-        status_display = status_map.get(p.get("status", "active"), p.get("status", "-"))
-        is_suspended = p.get("status") == "suspended"
-
+        status_label = get_player_status_label(p.get("status", "active"))
         rows.append([
             p.get("id", "-"),
             p.get("ingame_id", "-"),
             p.get("name", "-"),
             team_name,
             p.get("role", "-"),
-            status_display,
+            status_label,
             p.get("nationality", "-"),
         ])
 
@@ -233,16 +231,19 @@ def player_unsuspend(ctx, player_id):
 
 @player_cmd.command("status")
 @click.argument("player_id")
-@click.argument("new_status", type=click.Choice(["active", "injured", "suspended", "benched", "free_agent"]))
+@click.argument("new_status", type=click.Choice([
+    "active", "substitute", "suspended", "injured", "free_agent", "benched"
+]))
 @pass_context
 def player_set_status(ctx, player_id, new_status):
-    """设置选手状态"""
+    """设置选手状态（benched 为兼容旧称，等同于 substitute）"""
     players = ctx.db.load_players()
 
     found = False
+    norm_status = normalize_player_status(new_status)
     for p in players:
         if p.get("id") == player_id:
-            p["status"] = new_status
+            p["status"] = norm_status
             found = True
             break
 
@@ -251,11 +252,4 @@ def player_set_status(ctx, player_id, new_status):
         return
 
     ctx.db.save_players(players)
-    status_map = {
-        "active": "活跃",
-        "injured": "受伤",
-        "suspended": "禁赛",
-        "benched": "替补",
-        "free_agent": "自由人",
-    }
-    print_success(f"选手状态已更新为: {status_map.get(new_status, new_status)}")
+    print_success(f"选手状态已更新为: {get_player_status_label(norm_status)}")

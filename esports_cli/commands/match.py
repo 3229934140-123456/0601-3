@@ -18,6 +18,11 @@ from esports_cli.utils import (
     calculate_win_rate,
     validate_match_for_stage,
     log_operation,
+    normalize_player_status,
+    get_player_status_label,
+    is_player_available,
+    check_schedule_conflicts,
+    scan_all_conflicts,
 )
 
 
@@ -34,8 +39,11 @@ def match_cmd():
 @click.option("--datetime", "-d", "datetime_str", default=None, help="比赛时间 (YYYY-MM-DD HH:MM)")
 @click.option("--stage", "-s", default="", help="比赛阶段（指定时自动校验）")
 @click.option("--bo", default=3, type=int, help="BO几")
+@click.option("--conflict-window", "conflict_window", default=24, type=int,
+              help="冲突检测窗口（小时），0 表示全天，默认 24 小时")
+@click.option("--force", is_flag=True, help="忽略冲突强制创建")
 @pass_context
-def match_create(ctx, tournament, team_a, team_b, datetime_str, stage, bo):
+def match_create(ctx, tournament, team_a, team_b, datetime_str, stage, bo, conflict_window, force):
     """创建新比赛（自动同步到赛程）"""
     matches = ctx.db.load_matches()
     schedules = ctx.db.load_schedules()
@@ -67,11 +75,26 @@ def match_create(ctx, tournament, team_a, team_b, datetime_str, stage, bo):
         return
 
     if stage:
-        valid_stage, stage_err = validate_match_for_stage(
-            tour_info, stage, date_part, team_a, team_b
-        )
+        valid_stage, stage_err = validate_match_for_stage(tour_info, stage, normalized_dt, team_a, team_b)
         if not valid_stage:
             print_error(f"阶段校验失败: {stage_err}")
+            return
+
+    if not force:
+        conflicts = check_schedule_conflicts(
+            matches, team_a, team_b, normalized_dt,
+            window_hours=conflict_window
+        )
+        if conflicts:
+            print_warning("检测到赛程冲突:")
+            for c in conflicts:
+                team_name = team_a_info.get("name") if c["conflict_type"] == "team_a" else team_b_info.get("name")
+                print_warning(f"  队伍 {team_name} 与 {c['match_id']} ({c['match_datetime']}) 时间冲突")
+            if conflict_window == 0:
+                print_warning("（冲突检测范围：全天）")
+            else:
+                print_warning(f"（冲突检测窗口：{conflict_window} 小时）")
+            print_warning("确认要忽略冲突继续创建吗？使用 --force 参数强制创建")
             return
 
     match_id = generate_id("M")
@@ -104,7 +127,8 @@ def match_create(ctx, tournament, team_a, team_b, datetime_str, stage, bo):
 
     settings = ctx.db.load_settings()
     log_operation(ctx.db, settings, "create", "match", [match_id],
-                  f"{team_a_info.get('name')} vs {team_b_info.get('name')}, BO{bo}, {stage}")
+                  f"{team_a_info.get('name')} vs {team_b_info.get('name')}, BO{bo}, {stage}",
+                  after_data=dict(match_data))
 
     print_success(f"比赛创建成功: {match_id}")
     print_info(f"对阵: {team_a_info.get('name')} vs {team_b_info.get('name')}")
@@ -120,8 +144,11 @@ def match_create(ctx, tournament, team_a, team_b, datetime_str, stage, bo):
 @click.option("--team-a", help="队伍A ID")
 @click.option("--team-b", help="队伍B ID")
 @click.option("--tournament", "-t", help="赛事ID")
+@click.option("--conflict-window", "conflict_window", default=24, type=int,
+              help="冲突检测窗口（小时），0 表示全天，默认 24 小时")
+@click.option("--force", is_flag=True, help="忽略冲突强制修改")
 @pass_context
-def match_edit(ctx, match_id, datetime, stage, bo, team_a, team_b, tournament):
+def match_edit(ctx, match_id, datetime, stage, bo, team_a, team_b, tournament, conflict_window, force):
     """修改比赛信息（自动同步到赛程）"""
     matches = ctx.db.load_matches()
     schedules = ctx.db.load_schedules()
@@ -140,6 +167,7 @@ def match_edit(ctx, match_id, datetime, stage, bo, team_a, team_b, tournament):
         print_error(f"未找到比赛: {match_id}")
         return
 
+    before_match = dict(match_data)
     teams_map = {t["id"]: t for t in teams}
     tour_map = {t["id"]: t for t in tournaments}
 
@@ -198,6 +226,25 @@ def match_edit(ctx, match_id, datetime, stage, bo, team_a, team_b, tournament):
             print_error(f"阶段校验失败: {stage_err}")
             return
 
+    needs_conflict_check = (datetime is not None) or (team_a is not None) or (team_b is not None)
+    if needs_conflict_check and not force:
+        final_dt = updates.get("datetime", match_data.get("datetime", ""))
+        conflicts = check_schedule_conflicts(
+            matches, final_team_a, final_team_b, final_dt,
+            exclude_id=match_id, window_hours=conflict_window
+        )
+        if conflicts:
+            print_warning("检测到赛程冲突:")
+            for c in conflicts:
+                team_name = teams_map.get(c["team_id"], {}).get("name", c["team_id"])
+                print_warning(f"  队伍 {team_name} 与 {c['match_id']} ({c['match_datetime']}) 时间冲突")
+            if conflict_window == 0:
+                print_warning("（冲突检测范围：全天）")
+            else:
+                print_warning(f"（冲突检测窗口：{conflict_window} 小时）")
+            print_warning("确认要忽略冲突继续修改吗？使用 --force 参数强制修改")
+            return
+
     for key, value in updates.items():
         match_data[key] = value
 
@@ -222,7 +269,8 @@ def match_edit(ctx, match_id, datetime, stage, bo, team_a, team_b, tournament):
 
     settings = ctx.db.load_settings()
     detail_str = ", ".join(f"{k}={v}" for k, v in updates.items())
-    log_operation(ctx.db, settings, "edit", "match", [match_id], detail_str)
+    log_operation(ctx.db, settings, "edit", "match", [match_id], detail_str,
+                  before_data=before_match, after_data=dict(match_data))
 
     print_success(f"比赛已更新: {match_id}")
     for key, value in updates.items():
@@ -361,14 +409,18 @@ def match_score(ctx, match_id, score_a, score_b, mvp):
     schedules = ctx.db.load_schedules()
 
     found = False
+    before_match = None
+    after_match = None
     for m in matches:
         if m.get("id") == match_id:
+            before_match = dict(m)
             m["score_a"] = score_a
             m["score_b"] = score_b
             if m.get("status") == "scheduled":
                 m["status"] = "live"
             if mvp:
                 m["mvp"] = mvp
+            after_match = dict(m)
             found = True
             break
 
@@ -393,7 +445,8 @@ def match_score(ctx, match_id, score_a, score_b, mvp):
     detail = f"比分 {score_a}:{score_b}"
     if mvp:
         detail += f", MVP: {mvp}"
-    log_operation(ctx.db, settings, "score_update", "match", [match_id], detail)
+    log_operation(ctx.db, settings, "score_update", "match", [match_id], detail,
+                  before_data=before_match, after_data=after_match)
 
     print_success(f"比分已更新: {score_a} : {score_b}")
     print_info("已同步到赛程列表")
@@ -413,9 +466,12 @@ def match_map_result(ctx, match_id, map_name, score_a, score_b, winner, duration
     schedules = ctx.db.load_schedules()
 
     found = False
+    before_match = None
     updated_match = None
     for m in matches:
         if m.get("id") == match_id:
+            before_match = dict(m)
+            before_match["maps"] = m.get("maps", [])[:]
             if "maps" not in m:
                 m["maps"] = []
 
@@ -437,7 +493,8 @@ def match_map_result(ctx, match_id, map_name, score_a, score_b, winner, duration
                 m["status"] = "live"
 
             found = True
-            updated_match = m
+            updated_match = dict(m)
+            updated_match["maps"] = m["maps"][:]
             break
 
     if not found:
@@ -465,6 +522,12 @@ def match_map_result(ctx, match_id, map_name, score_a, score_b, winner, duration
 
     ctx.db.save_matches(matches)
     ctx.db.save_schedules(schedules)
+
+    settings = ctx.db.load_settings()
+    detail = f"地图: {map_name}, 比分 {score_a}:{score_b}, 胜方: {winner.upper()}"
+    log_operation(ctx.db, settings, "map_result", "match", [match_id], detail,
+                  before_data=before_match, after_data=updated_match)
+
     print_success(f"地图结果已录入: {map_name} - {score_a} : {score_b}")
     print_info("已同步到赛程列表")
 
@@ -903,13 +966,6 @@ def tournament_roster(ctx, tournament_id, region, team_status, available_only, m
         print_info("没有符合条件的参赛队伍")
         return
 
-    status_map = {
-        "active": "正常",
-        "suspended": "禁赛",
-        "injured": "受伤",
-        "substitute": "替补",
-    }
-
     print_info("")
     print_info(f"参赛队伍: {len(teams)} 支")
     print_info(f"最低出场要求: {min_players} 人")
@@ -922,17 +978,15 @@ def tournament_roster(ctx, tournament_id, region, team_status, available_only, m
 
         status_counts = {}
         for p in team_players:
-            s = p.get("status", "active")
+            s = normalize_player_status(p.get("status", "active"))
             status_counts[s] = status_counts.get(s, 0) + 1
 
+        active_count = status_counts.get("active", 0)
+        substitute_count = status_counts.get("substitute", 0)
         suspended_count = status_counts.get("suspended", 0)
         injured_count = status_counts.get("injured", 0)
-        substitute_count = status_counts.get("substitute", 0)
-        active_count = status_counts.get("active", 0)
 
-        available_players = [p for p in team_players
-                             if p.get("status", "active") in ["active", "substitute"]]
-        available_count = len(available_players)
+        available_count = sum(1 for p in team_players if is_player_available(p.get("status", "active")))
         meets_min = available_count >= min_players
 
         team_wins = 0
@@ -993,7 +1047,7 @@ def tournament_roster(ctx, tournament_id, region, team_status, available_only, m
                 deaths = stats.get("deaths", 0)
                 assists = stats.get("assists", 0)
                 kda = (kills + assists) / deaths if deaths > 0 else float(kills + assists)
-                p_status = status_map.get(p.get("status", "active"), p.get("status", "active"))
+                p_status = get_player_status_label(p.get("status", "active"))
                 print_info(f"    {p.get('ingame_id', ''):<10} "
                            f"{p.get('name', ''):<6} "
                            f"{p.get('role', ''):<6} "
@@ -1027,6 +1081,10 @@ def tournament_stage_list(ctx, tournament_id):
     for i, s in enumerate(stages, 1):
         teams = s.get("teams", [])
         team_count = len(teams) if teams else "(继承赛事)"
+        points = s.get("points", {})
+        points_str = f"胜{points.get('win', 3)} 平{points.get('draw', 1)} 负{points.get('loss', 0)}"
+        promotion = s.get("promotion_slots", 0)
+        relegation = s.get("relegation_slots", 0)
         rows.append([
             str(i),
             s.get("id", "-"),
@@ -1035,11 +1093,14 @@ def tournament_stage_list(ctx, tournament_id):
             s.get("end_date", "-"),
             f"BO{s.get('bo', 3)}",
             str(team_count),
+            str(promotion) if promotion else "-",
+            str(relegation) if relegation else "-",
+            points_str,
         ])
 
     print_table(
         f"赛事阶段 - {tour.get('name', tournament_id)}",
-        ["序号", "阶段ID", "阶段名称", "开始日期", "结束日期", "赛制", "参赛队数"],
+        ["序号", "阶段ID", "阶段名称", "开始日期", "结束日期", "赛制", "参赛队数", "晋级名额", "淘汰名额", "积分规则"],
         rows,
         table_style=ctx.table_style,
     )
@@ -1053,8 +1114,15 @@ def tournament_stage_list(ctx, tournament_id):
 @click.option("--end-date", required=True, help="结束日期 (YYYY-MM-DD)")
 @click.option("--bo", type=int, default=3, help="赛制")
 @click.option("--teams", help="参赛队伍ID列表，逗号分隔；不填则继承赛事全部队伍")
+@click.option("--promotion-slots", type=int, default=0, help="晋级名额（前N名晋级下一阶段）")
+@click.option("--relegation-slots", type=int, default=0, help="淘汰名额（后N名被淘汰）")
+@click.option("--allow-draw/--no-allow-draw", default=False, help="是否允许平局，默认不允许")
+@click.option("--points-win", type=int, default=3, help="胜场积分，默认3分")
+@click.option("--points-draw", type=int, default=1, help="平局积分，默认1分")
+@click.option("--points-loss", type=int, default=0, help="败场积分，默认0分")
 @pass_context
-def tournament_stage_add(ctx, tournament_id, stage_id, name, start_date, end_date, bo, teams):
+def tournament_stage_add(ctx, tournament_id, stage_id, name, start_date, end_date, bo, teams,
+                         promotion_slots, relegation_slots, allow_draw, points_win, points_draw, points_loss):
     """添加赛事阶段"""
     from datetime import datetime
 
@@ -1100,6 +1168,14 @@ def tournament_stage_add(ctx, tournament_id, stage_id, name, start_date, end_dat
         "start_date": start_date,
         "end_date": end_date,
         "bo": bo,
+        "promotion_slots": promotion_slots,
+        "relegation_slots": relegation_slots,
+        "allow_draw": allow_draw,
+        "points": {
+            "win": points_win,
+            "draw": points_draw,
+            "loss": points_loss,
+        },
     }
     if stage_teams:
         new_stage["teams"] = stage_teams
@@ -1111,6 +1187,10 @@ def tournament_stage_add(ctx, tournament_id, stage_id, name, start_date, end_dat
     print_success(f"已添加阶段: {name} ({stage_id})")
     print_info(f"  时间: {start_date} ~ {end_date}")
     print_info(f"  赛制: BO{bo}")
+    print_info(f"  积分规则: 胜{points_win}分 平{points_draw}分 负{points_loss}分")
+    print_info(f"  平局: {'允许' if allow_draw else '不允许'}")
+    print_info(f"  晋级名额: {promotion_slots}")
+    print_info(f"  淘汰名额: {relegation_slots}")
     if stage_teams:
         print_info(f"  参赛队伍: {len(stage_teams)} 支")
     else:
@@ -1124,9 +1204,16 @@ def tournament_stage_add(ctx, tournament_id, stage_id, name, start_date, end_dat
 @click.option("--start-date", help="开始日期")
 @click.option("--end-date", help="结束日期")
 @click.option("--bo", type=int, help="赛制")
-@click.option("--teams", help="参赛队伍ID列表，逗号分隔")
+@click.option("--teams", help="参赛队伍ID列表，逗号分隔；传空字符串清除")
+@click.option("--promotion-slots", type=int, help="晋级名额")
+@click.option("--relegation-slots", type=int, help="淘汰名额")
+@click.option("--allow-draw/--no-allow-draw", "allow_draw", default=None, help="是否允许平局")
+@click.option("--points-win", type=int, help="胜场积分")
+@click.option("--points-draw", type=int, help="平局积分")
+@click.option("--points-loss", type=int, help="败场积分")
 @pass_context
-def tournament_stage_edit(ctx, tournament_id, stage_id, name, start_date, end_date, bo, teams):
+def tournament_stage_edit(ctx, tournament_id, stage_id, name, start_date, end_date, bo, teams,
+                          promotion_slots, relegation_slots, allow_draw, points_win, points_draw, points_loss):
     """修改赛事阶段"""
     from datetime import datetime
 
@@ -1187,6 +1274,21 @@ def tournament_stage_edit(ctx, tournament_id, stage_id, name, start_date, end_da
         stage["end_date"] = end_date
     if bo is not None:
         stage["bo"] = bo
+    if promotion_slots is not None:
+        stage["promotion_slots"] = promotion_slots
+    if relegation_slots is not None:
+        stage["relegation_slots"] = relegation_slots
+    if allow_draw is not None:
+        stage["allow_draw"] = allow_draw
+    if points_win is not None or points_draw is not None or points_loss is not None:
+        points = stage.get("points", {"win": 3, "draw": 1, "loss": 0})
+        if points_win is not None:
+            points["win"] = points_win
+        if points_draw is not None:
+            points["draw"] = points_draw
+        if points_loss is not None:
+            points["loss"] = points_loss
+        stage["points"] = points
 
     ctx.db.save_tournaments(tournaments)
     print_success(f"已更新阶段: {stage.get('name', stage_id)}")

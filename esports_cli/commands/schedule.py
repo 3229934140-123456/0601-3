@@ -1,4 +1,6 @@
 import click
+import os
+import json
 from datetime import datetime, timedelta
 
 from esports_cli.context import pass_context
@@ -16,6 +18,8 @@ from esports_cli.utils import (
     check_team_exists,
     validate_match_for_stage,
     log_operation,
+    check_schedule_conflicts,
+    scan_all_conflicts,
 )
 
 
@@ -122,8 +126,11 @@ def schedule_list(ctx, tournament, date, team, upcoming, past):
 @click.option("--datetime", "-d", "datetime_str", required=True, help="比赛时间 (YYYY-MM-DD HH:MM)")
 @click.option("--stage", "-s", default="", help="比赛阶段（指定时自动校验）")
 @click.option("--bo", default=3, type=int, help="BO几")
+@click.option("--conflict-window", "conflict_window", default=24, type=int,
+              help="冲突检测窗口（小时），0 表示全天，默认 24 小时")
+@click.option("--force", is_flag=True, help="忽略冲突强制添加")
 @pass_context
-def schedule_add(ctx, tournament, team_a, team_b, datetime_str, stage, bo):
+def schedule_add(ctx, tournament, team_a, team_b, datetime_str, stage, bo, conflict_window, force):
     """添加赛程（自动同步到比赛记录）"""
     schedules = ctx.db.load_schedules()
     matches = ctx.db.load_matches()
@@ -159,6 +166,23 @@ def schedule_add(ctx, tournament, team_a, team_b, datetime_str, stage, bo):
             print_error(f"阶段校验失败: {stage_err}")
             return
 
+    if not force:
+        conflicts = check_schedule_conflicts(
+            schedules, team_a, team_b, normalized_dt,
+            window_hours=conflict_window
+        )
+        if conflicts:
+            print_warning("检测到赛程冲突:")
+            for c in conflicts:
+                team_name = team_a_info.get("name") if c["conflict_type"] == "team_a" else team_b_info.get("name")
+                print_warning(f"  队伍 {team_name} 与 {c['match_id']} ({c['match_datetime']}) 时间冲突")
+            if conflict_window == 0:
+                print_warning("（冲突检测范围：全天）")
+            else:
+                print_warning(f"（冲突检测窗口：{conflict_window} 小时）")
+            print_warning("确认要忽略冲突继续添加吗？使用 --force 参数强制添加")
+            return
+
     match_id = generate_id("M")
     schedule = {
         "id": match_id,
@@ -191,7 +215,8 @@ def schedule_add(ctx, tournament, team_a, team_b, datetime_str, stage, bo):
 
     settings = ctx.db.load_settings()
     log_operation(ctx.db, settings, "create", "schedule", [match_id],
-                  f"{team_a_info.get('name')} vs {team_b_info.get('name')}, BO{bo}, {stage}")
+                  f"{team_a_info.get('name')} vs {team_b_info.get('name')}, BO{bo}, {stage}",
+                  after_data=dict(schedule))
 
     print_success(f"赛程已添加: {match_id}")
     print_info(f"对阵: {team_a_info.get('name')} vs {team_b_info.get('name')}")
@@ -207,8 +232,11 @@ def schedule_add(ctx, tournament, team_a, team_b, datetime_str, stage, bo):
 @click.option("--team-a", help="队伍A ID")
 @click.option("--team-b", help="队伍B ID")
 @click.option("--tournament", "-t", help="赛事ID")
+@click.option("--conflict-window", "conflict_window", default=24, type=int,
+              help="冲突检测窗口（小时），0 表示全天，默认 24 小时")
+@click.option("--force", is_flag=True, help="忽略冲突强制修改")
 @pass_context
-def schedule_edit(ctx, schedule_id, datetime, stage, bo, team_a, team_b, tournament):
+def schedule_edit(ctx, schedule_id, datetime, stage, bo, team_a, team_b, tournament, conflict_window, force):
     """修改赛程信息（自动同步到比赛记录）"""
     schedules = ctx.db.load_schedules()
     matches = ctx.db.load_matches()
@@ -227,6 +255,7 @@ def schedule_edit(ctx, schedule_id, datetime, stage, bo, team_a, team_b, tournam
         print_error(f"未找到赛程: {schedule_id}")
         return
 
+    before_sched = dict(sched_data)
     teams_map = {t["id"]: t for t in teams}
     tour_map = {t["id"]: t for t in tournaments}
 
@@ -285,6 +314,25 @@ def schedule_edit(ctx, schedule_id, datetime, stage, bo, team_a, team_b, tournam
             print_error(f"阶段校验失败: {stage_err}")
             return
 
+    needs_conflict_check = (datetime is not None) or (team_a is not None) or (team_b is not None)
+    if needs_conflict_check and not force:
+        final_dt = updates.get("datetime", sched_data.get("datetime", ""))
+        conflicts = check_schedule_conflicts(
+            schedules, final_team_a, final_team_b, final_dt,
+            exclude_id=schedule_id, window_hours=conflict_window
+        )
+        if conflicts:
+            print_warning("检测到赛程冲突:")
+            for c in conflicts:
+                team_name = teams_map.get(c["team_id"], {}).get("name", c["team_id"])
+                print_warning(f"  队伍 {team_name} 与 {c['match_id']} ({c['match_datetime']}) 时间冲突")
+            if conflict_window == 0:
+                print_warning("（冲突检测范围：全天）")
+            else:
+                print_warning(f"（冲突检测窗口：{conflict_window} 小时）")
+            print_warning("确认要忽略冲突继续修改吗？使用 --force 参数强制修改")
+            return
+
     for key, value in updates.items():
         sched_data[key] = value
 
@@ -309,12 +357,99 @@ def schedule_edit(ctx, schedule_id, datetime, stage, bo, team_a, team_b, tournam
 
     settings = ctx.db.load_settings()
     detail_str = ", ".join(f"{k}={v}" for k, v in updates.items())
-    log_operation(ctx.db, settings, "edit", "schedule", [schedule_id], detail_str)
+    log_operation(ctx.db, settings, "edit", "schedule", [schedule_id], detail_str,
+                  before_data=before_sched, after_data=dict(sched_data))
 
     print_success(f"赛程已更新: {schedule_id}")
     for key, value in updates.items():
         print_info(f"  {key}: {value}")
     print_info("已同步更新比赛记录")
+
+
+@schedule_cmd.command("conflicts")
+@click.option("--window", "-w", "window_hours", default=24, type=int,
+              help="冲突检测窗口（小时），0 表示全天，默认 24 小时")
+@click.option("--tournament", "-t", default="", help="按赛事筛选")
+@click.option("--output", "-O", "output_path", default="", help="导出到文件 (.md 或 .json)")
+@pass_context
+def schedule_conflicts(ctx, window_hours, tournament, output_path):
+    """扫描赛程冲突（同一队伍在时间窗口内被安排多场比赛）"""
+    schedules = ctx.db.load_schedules()
+    teams = {t["id"]: t for t in ctx.db.load_teams()}
+    tournaments = {t["id"]: t for t in ctx.db.load_tournaments()}
+
+    filtered = schedules
+    if tournament:
+        filtered = [s for s in filtered if s.get("tournament_id") == tournament]
+
+    if not filtered:
+        print_info("没有赛程数据")
+        return
+
+    conflicts = scan_all_conflicts(filtered, window_hours=window_hours)
+
+    if not conflicts:
+        print_success("未检测到赛程冲突")
+        if window_hours == 0:
+            print_info("（检测范围：全天）")
+        else:
+            print_info(f"（检测窗口：{window_hours} 小时）")
+        return
+
+    rows = []
+    for i, c in enumerate(conflicts, 1):
+        team_name = teams.get(c["team_id"], {}).get("name", c["team_id"])
+        rows.append([
+            str(i),
+            team_name,
+            c["match1_id"],
+            c["datetime1"],
+            c["match2_id"],
+            c["datetime2"],
+        ])
+
+    print_table(
+        "赛程冲突列表",
+        ["序号", "冲突队伍", "比赛1", "时间1", "比赛2", "时间2"],
+        rows,
+        table_style=ctx.table_style,
+    )
+    print_warning(f"共发现 {len(conflicts)} 处冲突")
+    if window_hours == 0:
+        print_info("（检测范围：全天）")
+    else:
+        print_info(f"（检测窗口：{window_hours} 小时）")
+
+    if output_path:
+        output_path = os.path.abspath(output_path)
+        if output_path.endswith(".json"):
+            result = {
+                "total": len(conflicts),
+                "window_hours": window_hours,
+                "conflicts": conflicts,
+            }
+            with open(output_path, "w", encoding="utf-8") as f:
+                json.dump(result, f, ensure_ascii=False, indent=2)
+            print_success(f"冲突列表已导出到 {output_path}")
+        elif output_path.endswith(".md"):
+            lines = []
+            lines.append("# 赛程冲突报告\n")
+            lines.append(f"**冲突总数**: {len(conflicts)}\n")
+            lines.append(f"**检测窗口**: {'全天' if window_hours == 0 else str(window_hours) + ' 小时'}\n")
+            lines.append("## 冲突列表\n")
+            lines.append("| 序号 | 冲突队伍 | 比赛1 | 时间1 | 比赛2 | 时间2 |")
+            lines.append("|------|----------|-------|-------|-------|-------|")
+            for i, c in enumerate(conflicts, 1):
+                team_name = teams.get(c["team_id"], {}).get("name", c["team_id"])
+                lines.append(
+                    f"| {i} | {team_name} | {c['match1_id']} | {c['datetime1']} "
+                    f"| {c['match2_id']} | {c['datetime2']} |"
+                )
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            print_success(f"冲突列表已导出到 {output_path}")
+        else:
+            print_error("只支持 .json 或 .md 格式")
 
 
 @schedule_cmd.command("reminders")

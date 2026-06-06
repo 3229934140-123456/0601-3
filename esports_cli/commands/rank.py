@@ -6,9 +6,11 @@ from esports_cli.utils import (
     print_table,
     print_success,
     print_error,
+    print_warning,
     print_info,
     calculate_win_rate,
     console,
+    get_tournament_stage,
 )
 
 
@@ -20,33 +22,59 @@ def rank_cmd():
 
 @rank_cmd.command("standings")
 @click.option("--tournament", "-t", help="赛事ID")
-@click.option("--sort-by", "-s", default="points",
+@click.option("--stage", "-s", default="", help="阶段ID（按阶段筛选比赛）")
+@click.option("--sort-by", "-s2", "sort_by", default="points",
               type=click.Choice(["points", "wins", "win_rate", "net_score", "map_diff", "h2h"]),
               help="主排序规则")
 @click.option("--tiebreaker", "-b", default="map_diff,wins,h2h",
               help="并列排名规则，逗号分隔，可选: wins, net_score, map_diff, h2h, win_rate")
 @pass_context
-def rank_standings(ctx, tournament, sort_by, tiebreaker):
+def rank_standings(ctx, tournament, stage, sort_by, tiebreaker):
     """查看赛事积分榜"""
     teams = ctx.db.load_teams()
     matches = ctx.db.load_matches()
     tournaments = ctx.db.load_tournaments()
 
+    stage_config = None
     if tournament:
         tour = next((t for t in tournaments if t.get("id") == tournament), None)
         if not tour:
             print_error(f"未找到赛事: {tournament}")
             return
         tour_teams = tour.get("teams", [])
-        team_list = [t for t in teams if t.get("id") in tour_teams]
         tour_name = tour.get("name", tournament)
+
+        if stage:
+            stage_config = get_tournament_stage(tour, stage)
+            if not stage_config:
+                print_error(f"阶段不存在: {stage}")
+                return
+            stage_teams = stage_config.get("teams")
+            if stage_teams is not None:
+                team_list = [t for t in teams if t.get("id") in stage_teams]
+            else:
+                team_list = [t for t in teams if t.get("id") in tour_teams]
+            tour_name = f"{tour_name} - {stage_config.get('name', stage)}"
+        else:
+            team_list = [t for t in teams if t.get("id") in tour_teams]
     else:
+        if stage:
+            print_warning("未指定赛事时 --stage 参数无效，已忽略")
         team_list = teams
         tour_name = "所有赛事"
 
     if not team_list:
         print_info("暂无队伍数据")
         return
+
+    points_win = 3
+    points_draw = 1
+    points_loss = 0
+    if stage_config and stage_config.get("points"):
+        pts = stage_config["points"]
+        points_win = pts.get("win", 3)
+        points_draw = pts.get("draw", 1)
+        points_loss = pts.get("loss", 0)
 
     team_ids = [t.get("id") for t in team_list]
 
@@ -66,6 +94,8 @@ def rank_standings(ctx, tournament, sort_by, tiebreaker):
             if m.get("status") != "finished":
                 continue
             if tournament and m.get("tournament_id") != tournament:
+                continue
+            if stage and m.get("stage", "") != stage:
                 continue
 
             is_team_a = m.get("team_a_id") == team_id
@@ -93,23 +123,25 @@ def rank_standings(ctx, tournament, sort_by, tiebreaker):
                 score_against += s_b
                 if s_a > s_b:
                     wins += 1
-                    points += 3
+                    points += points_win
                 elif s_a < s_b:
                     losses += 1
+                    points += points_loss
                 else:
                     draws += 1
-                    points += 1
+                    points += points_draw
             else:
                 score_for += s_b
                 score_against += s_a
                 if s_b > s_a:
                     wins += 1
-                    points += 3
+                    points += points_win
                 elif s_b < s_a:
                     losses += 1
+                    points += points_loss
                 else:
                     draws += 1
-                    points += 1
+                    points += points_draw
 
         net_score = score_for - score_against
         map_diff = map_wins - map_losses
@@ -126,6 +158,8 @@ def rank_standings(ctx, tournament, sort_by, tiebreaker):
                 if m.get("status") != "finished":
                     continue
                 if tournament and m.get("tournament_id") != tournament:
+                    continue
+                if stage and m.get("stage", "") != stage:
                     continue
                 a = m.get("team_a_id")
                 b = m.get("team_b_id")
@@ -257,7 +291,14 @@ def rank_standings(ctx, tournament, sort_by, tiebreaker):
             rule = get_deciding_rule(standings[i-1], standings[i])
             deciding_rules.append(rule_names.get(rule, rule))
 
+    promotion_slots = 0
+    relegation_slots = 0
+    if stage_config:
+        promotion_slots = stage_config.get("promotion_slots", 0)
+        relegation_slots = stage_config.get("relegation_slots", 0)
+
     rows = []
+    total_teams = len(standings)
     for i, s in enumerate(standings, 1):
         rank_tag = ""
         if i == 1:
@@ -268,6 +309,14 @@ def rank_standings(ctx, tournament, sort_by, tiebreaker):
             rank_tag = "[季军]"
 
         rank_display = f"{i} {rank_tag}" if rank_tag else str(i)
+
+        zone = ""
+        if promotion_slots > 0 and i <= promotion_slots:
+            zone = "晋级区"
+        elif relegation_slots > 0 and i > total_teams - relegation_slots:
+            zone = "淘汰区"
+        elif promotion_slots > 0 or relegation_slots > 0:
+            zone = "待定"
 
         reason_parts = []
         reason_parts.append(f"积分{s['points']}")
@@ -283,7 +332,7 @@ def rank_standings(ctx, tournament, sort_by, tiebreaker):
 
         dr = deciding_rules[i-1] if i-1 < len(deciding_rules) else "-"
 
-        rows.append([
+        row = [
             rank_display,
             s["team_name"],
             str(s["wins"]),
@@ -297,17 +346,29 @@ def rank_standings(ctx, tournament, sort_by, tiebreaker):
             str(s["points"]),
             dr,
             reason,
-        ])
+        ]
+        if promotion_slots > 0 or relegation_slots > 0:
+            row.insert(2, zone)
+        rows.append(row)
+
+    headers = ["排名", "队伍", "胜", "负", "胜率", "地图胜-负", "净胜图", "得分", "失分", "净胜分", "积分", "区分规则", "排名依据"]
+    if promotion_slots > 0 or relegation_slots > 0:
+        headers.insert(2, "分区")
 
     print_table(
         f"积分榜 - {tour_name}",
-        ["排名", "队伍", "胜", "负", "胜率", "地图胜-负", "净胜图", "得分", "失分", "净胜分", "积分", "区分规则", "排名依据"],
+        headers,
         rows,
         table_style=ctx.table_style,
     )
     print_info(f"共 {len(standings)} 支队伍")
     print_info(f"排序规则: 主规则={rule_names.get(sort_by, sort_by)}")
     print_info(f"并列规则: {' → '.join(rule_names.get(r, r) for r in tb_rules)}")
+    print_info(f"积分规则: 胜{points_win}分 平{points_draw}分 负{points_loss}分")
+    if promotion_slots > 0:
+        print_info(f"晋级名额: 前 {promotion_slots} 名")
+    if relegation_slots > 0:
+        print_info(f"淘汰名额: 后 {relegation_slots} 名")
     print_info("区分规则: 与上一名队伍比较时，起决定性作用的规则")
 
 

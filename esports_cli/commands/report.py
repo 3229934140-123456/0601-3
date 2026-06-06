@@ -18,6 +18,9 @@ from esports_cli.utils import (
     validate_datetime,
     console,
     log_operation,
+    normalize_player_status,
+    get_player_status_label,
+    is_player_available,
 )
 
 
@@ -597,15 +600,13 @@ def report_team(ctx, team_id, tournament, date_from, date_to,
 
     status_counts = {}
     for p in team_players:
-        s = p.get("status", "active")
+        s = normalize_player_status(p.get("status", "active"))
         status_counts[s] = status_counts.get(s, 0) + 1
 
-    available_players = [p for p in team_players
-                         if p.get("status", "active") in ["active", "substitute"]]
-    available_count = len(available_players)
+    available_count = sum(1 for p in team_players if is_player_available(p.get("status", "active")))
     meets_min = available_count >= min_players
 
-    display_players = available_players if available_only else team_players
+    display_players = [p for p in team_players if is_player_available(p.get("status", "active"))] if available_only else team_players
 
     player_stats = []
     for p in display_players:
@@ -619,7 +620,7 @@ def report_team(ctx, team_id, tournament, date_from, date_to,
             "ingame_id": p.get("ingame_id", ""),
             "name": p.get("name", ""),
             "role": p.get("role", ""),
-            "status": p.get("status", "active"),
+            "status": normalize_player_status(p.get("status", "active")),
             "kills": kills,
             "deaths": deaths,
             "assists": assists,
@@ -744,9 +745,8 @@ def _generate_team_report_text(team_data, total, wins, losses, win_rate,
         lines.append("-" * 70)
         lines.append(f"  {'游戏ID':<10} {'角色':<6} {'击杀':<6} {'死亡':<6} {'助攻':<6} {'KDA':<8} {'状态':<8}")
         lines.append(f"  {'-'*10} {'-'*6} {'-'*6} {'-'*6} {'-'*6} {'-'*8} {'-'*8}")
-        status_map = {"active": "正常", "suspended": "禁赛", "injured": "受伤"}
         for p in player_stats[:8]:
-            status = status_map.get(p["status"], p["status"])
+            status = get_player_status_label(p["status"])
             lines.append(f"  {p['ingame_id']:<10} {p['role']:<6} {p['kills']:<6} "
                          f"{p['deaths']:<6} {p['assists']:<6} {p['kda']:<8} {status:<8}")
         if len(player_stats) > 8:
@@ -849,9 +849,8 @@ def _generate_team_report_md(team_data, total, wins, losses, win_rate,
         lines.append("")
         lines.append("| 游戏ID | 姓名 | 角色 | 击杀 | 死亡 | 助攻 | KDA | 状态 |")
         lines.append("|--------|------|------|------|------|------|-----|------|")
-        status_map = {"active": "正常", "suspended": "禁赛", "injured": "受伤"}
         for p in player_stats:
-            status = status_map.get(p["status"], p["status"])
+            status = get_player_status_label(p["status"])
             lines.append(f"| {p['ingame_id']} | {p['name']} | {p['role']} | "
                          f"{p['kills']} | {p['deaths']} | {p['assists']} | {p['kda']} | {status} |")
         lines.append("")
@@ -1020,13 +1019,15 @@ def report_export(ctx, data_type, output_format, output):
         print_info(f"  - {f}")
 
 
-def _validate_import_data(ctx, data_type, data):
+def _validate_import_data(ctx, data_type, data, extra_team_ids=None, extra_tournament_ids=None):
     """统一的导入数据校验函数，返回 (valid_items, results)
 
     results 结构:
         total, success, failed, skipped,
         error_types: {duplicate_id, missing_fields, invalid_date, missing_ref, ...},
         errors: [详细错误列表]
+
+    extra_team_ids / extra_tournament_ids: 额外视为有效的引用 ID（用于同一导入包内的依赖预检）
     """
     required_fields_map = {
         "teams": ["id", "name", "region"],
@@ -1047,6 +1048,10 @@ def _validate_import_data(ctx, data_type, data):
 
     teams_ids = {t["id"] for t in ctx.db.load_teams()}
     tournament_ids = {t["id"] for t in ctx.db.load_tournaments()}
+    if extra_team_ids:
+        teams_ids = teams_ids | set(extra_team_ids)
+    if extra_tournament_ids:
+        tournament_ids = tournament_ids | set(extra_tournament_ids)
 
     results = {
         "total": len(data),
@@ -1183,8 +1188,193 @@ def _print_import_results(title, results, table_style):
             print_info(f"  ... 还有 {len(results['errors']) - 25} 条提示")
 
 
+def _import_all(ctx, file_path, input_format, dry_run, summary_json, type_names):
+    """事务式导入全部类型，失败回滚"""
+    all_data = _read_import_file(file_path, input_format)
+    if all_data is None:
+        return
+    if not isinstance(all_data, dict):
+        print_error("all 模式下 JSON 必须是对象，包含 teams/players/matches/schedules 键")
+        return
+
+    order = ["teams", "players", "matches", "schedules"]
+
+    print_info("第一步：全部类型预检（含包内依赖识别）...")
+    all_valid = {}
+    all_results = {}
+    extra_team_ids = []
+    extra_tournament_ids = []
+
+    precheck_ok = True
+    for dt in order:
+        items = all_data.get(dt, [])
+        if not items:
+            continue
+        valid_items, results = _validate_import_data(
+            ctx, dt, items,
+            extra_team_ids=extra_team_ids,
+            extra_tournament_ids=extra_tournament_ids,
+        )
+        all_valid[dt] = valid_items
+        all_results[dt] = results
+        if results["failed"] > 0:
+            precheck_ok = False
+        if dt == "teams":
+            extra_team_ids = [t["id"] for t in valid_items]
+
+    summary_rows = []
+    total_success = 0
+    total_failed = 0
+    total_skipped = 0
+    for dt in order:
+        if dt in all_results:
+            r = all_results[dt]
+            summary_rows.append([type_names[dt], str(r["total"]), str(r["success"]), str(r["failed"]), str(r["skipped"])])
+            total_success += r["success"]
+            total_failed += r["failed"]
+            total_skipped += r["skipped"]
+
+    print_table(
+        "导入预检汇总 - 全部类型",
+        ["数据类型", "总数", "可导入", "失败", "跳过"],
+        summary_rows + [
+            ["合计", str(sum(r["total"] for r in all_results.values())),
+             str(total_success), str(total_failed), str(total_skipped)]
+        ],
+        table_style=ctx.table_style,
+    )
+
+    if not precheck_ok:
+        print_error("")
+        print_error(f"预检未通过，共 {total_failed} 条错误。事务已取消，未写入任何数据。")
+        for dt in order:
+            if dt in all_results and all_results[dt]["errors"]:
+                print_info("")
+                print_info(f"  {type_names[dt]} 错误详情:")
+                for err in all_results[dt]["errors"][:10]:
+                    print_info(f"    - {err}")
+        return
+
+    print_success("")
+    print_success("预检全部通过！")
+
+    if dry_run:
+        print_info("试运行模式，未实际保存数据。去掉 --dry-run 参数以实际导入。")
+        return
+
+    print_info("")
+    print_info("第二步：执行事务式导入...")
+
+    save_map = {
+        "teams": (ctx.db.load_teams, ctx.db.save_teams),
+        "players": (ctx.db.load_players, ctx.db.save_players),
+        "matches": (ctx.db.load_matches, ctx.db.save_matches),
+        "schedules": (ctx.db.load_schedules, ctx.db.save_schedules),
+    }
+
+    backups = {}
+    committed = []
+    rollback_count = 0
+    failed_type = None
+    failed_reason = None
+
+    try:
+        for dt in order:
+            if dt not in all_valid or not all_valid[dt]:
+                continue
+
+            load_func, save_func = save_map[dt]
+            original = load_func()
+            backups[dt] = original
+
+            combined = original + all_valid[dt]
+            save_func(combined)
+            committed.append(dt)
+            print_info(f"  ✓ 已导入 {type_names[dt]}: {len(all_valid[dt])} 条")
+
+            if dt == "matches":
+                schedules = ctx.db.load_schedules()
+                sched_ids = {s["id"] for s in schedules}
+                sched_backup = backups.get("schedules", schedules[:])
+                if "schedules" not in backups:
+                    backups["schedules"] = sched_backup
+                new_sched = []
+                for item in all_valid[dt]:
+                    if item["id"] not in sched_ids:
+                        sched_item = {k: v for k, v in item.items()
+                                      if k not in ["mvp", "duration", "notes", "type"]}
+                        sched_item.setdefault("status", "scheduled")
+                        sched_item.setdefault("score_a", 0)
+                        sched_item.setdefault("score_b", 0)
+                        sched_item.setdefault("maps", [])
+                        schedules.append(sched_item)
+                        new_sched.append(sched_item)
+                ctx.db.save_schedules(schedules)
+                if new_sched:
+                    if "schedules" not in committed:
+                        committed.append("schedules")
+
+            if dt == "schedules":
+                matches = ctx.db.load_matches()
+                match_ids = {m["id"] for m in matches}
+                match_backup = backups.get("matches", matches[:])
+                if "matches" not in backups:
+                    backups["matches"] = match_backup
+                new_matches = []
+                for item in all_valid[dt]:
+                    if item["id"] not in match_ids:
+                        match_item = dict(item)
+                        match_item.setdefault("mvp", "")
+                        match_item.setdefault("duration", "")
+                        match_item.setdefault("notes", "")
+                        match_item.setdefault("type", "official")
+                        matches.append(match_item)
+                        new_matches.append(match_item)
+                ctx.db.save_matches(matches)
+                if new_matches:
+                    if "matches" not in committed:
+                        committed.append("matches")
+
+    except Exception as e:
+        failed_type = dt
+        failed_reason = str(e)
+
+    if failed_type:
+        print_error("")
+        print_error(f"导入 {type_names.get(failed_type, failed_type)} 时出错，开始回滚...")
+        print_error(f"失败原因: {failed_reason}")
+
+        for dt in reversed(committed):
+            load_func, save_func = save_map[dt]
+            if dt in backups:
+                save_func(backups[dt])
+                rollback_count += len(all_valid.get(dt, []))
+                print_info(f"  ↺ 已回滚 {type_names[dt]}")
+
+        print_warning("")
+        print_warning(f"事务已回滚，共回滚 {rollback_count} 条数据。")
+        print_warning(f"失败类型: {type_names.get(failed_type, failed_type)}")
+        print_warning(f"失败原因: {failed_reason}")
+        return
+
+    all_new_ids = []
+    all_new_items = {}
+    for dt in committed:
+        all_new_ids.extend([item.get("id") for item in all_valid.get(dt, [])])
+        all_new_items[dt] = all_valid.get(dt, [])
+
+    settings = ctx.db.load_settings()
+    detail = f"事务式导入 {len(committed)} 类，共 {len(all_new_ids)} 条数据，来自 {file_path}"
+    log_operation(ctx.db, settings, "import", "all", all_new_ids, detail,
+                  after_data=all_new_items)
+
+    print_success("")
+    print_success(f"事务式导入完成！成功导入 {len(all_new_ids)} 条数据，"
+                  f"涉及 {len(committed)} 种类型。")
+
+
 @report_cmd.command("import")
-@click.argument("data_type", type=click.Choice(["matches", "teams", "players", "schedules"]))
+@click.argument("data_type", type=click.Choice(["matches", "teams", "players", "schedules", "all"]))
 @click.argument("file_path", type=click.Path(exists=True))
 @click.option("--format", "-f", "input_format", default="json",
               type=click.Choice(["json", "csv"]),
@@ -1193,7 +1383,18 @@ def _print_import_results(title, results, table_style):
 @click.option("--summary-json", is_flag=True, help="输出JSON格式的变更摘要")
 @pass_context
 def report_import(ctx, data_type, file_path, input_format, dry_run, summary_json):
-    """批量导入数据"""
+    """批量导入数据（all 模式为事务式导入，失败自动回滚）"""
+    type_names = {
+        "teams": "队伍",
+        "players": "选手",
+        "matches": "比赛",
+        "schedules": "赛程",
+    }
+
+    if data_type == "all":
+        _import_all(ctx, file_path, input_format, dry_run, summary_json, type_names)
+        return
+
     data = _read_import_file(file_path, input_format)
     if data is None:
         return
@@ -1288,7 +1489,8 @@ def report_import(ctx, data_type, file_path, input_format, dry_run, summary_json
         settings = ctx.db.load_settings()
         new_ids = [item.get("id") for item in valid_items]
         detail = f"导入 {len(valid_items)} 条 {data_type}，来自 {file_path}"
-        log_operation(ctx.db, settings, "import", data_type, new_ids, detail)
+        log_operation(ctx.db, settings, "import", data_type, new_ids, detail,
+                      after_data=valid_items[:])
 
         print_success("")
         print_success(f"导入完成，成功 {results['success']} 条。")
@@ -1326,11 +1528,24 @@ def report_import_preview(ctx, data_type, file_path, input_format):
         total_failed = 0
         total_skipped = 0
 
+        team_items = all_data.get("teams", [])
+        team_valid, team_res = _validate_import_data(ctx, "teams", team_items)
+        extra_team_ids = [t["id"] for t in team_valid]
+
+        extra_tournament_ids = []
+
         for dt in ["teams", "players", "matches", "schedules"]:
             items = all_data.get(dt, [])
             if not items:
                 continue
-            _, res = _validate_import_data(ctx, dt, items)
+            if dt == "teams":
+                _, res = team_valid, team_res
+            else:
+                _, res = _validate_import_data(
+                    ctx, dt, items,
+                    extra_team_ids=extra_team_ids,
+                    extra_tournament_ids=extra_tournament_ids,
+                )
             summary.append((type_names[dt], res))
             total_success += res["success"]
             total_failed += res["failed"]
@@ -1614,6 +1829,12 @@ def report_restore(ctx, backup_file, restore_type, dry_run, yes, summary_json):
         "settings": (ctx.db.load_settings, ctx.db.save_settings),
     }
 
+    before_restore = {}
+    for t in target_types:
+        if t in save_map:
+            load_func, _ = save_map[t]
+            before_restore[t] = load_func()
+
     for t in target_types:
         if t in save_map:
             _, save_func = save_map[t]
@@ -1621,10 +1842,286 @@ def report_restore(ctx, backup_file, restore_type, dry_run, yes, summary_json):
 
     settings = ctx.db.load_settings()
     detail = f"恢复 {len(target_types)} 类数据，备份: {backup_file}, 类型: {restore_type}"
-    log_operation(ctx.db, settings, "restore", "system", target_types, detail)
+    log_operation(ctx.db, settings, "restore", "system", target_types, detail,
+                  before_data=before_restore,
+                  after_data={t: data[t] for t in target_types if t in data})
 
     print_success("")
     print_success(f"数据恢复完成！已恢复 {len(target_types)} 类数据。")
+
+
+def _diff_data_type(current_list, backup_list, name_field="name"):
+    """对比单类型数据，返回 (added, removed, modified)
+
+    modified 每项格式: {"id": ..., "name": ..., "changes": [{"field":..., "old":..., "new":...}]}
+    """
+    current_by_id = {item["id"]: item for item in current_list if item.get("id")}
+    backup_by_id = {item["id"]: item for item in backup_list if item.get("id")}
+
+    current_ids = set(current_by_id.keys())
+    backup_ids = set(backup_by_id.keys())
+
+    added_ids = current_ids - backup_ids
+    removed_ids = backup_ids - current_ids
+    common_ids = current_ids & backup_ids
+
+    added = [current_by_id[i] for i in sorted(added_ids)]
+    removed = [backup_by_id[i] for i in sorted(removed_ids)]
+
+    modified = []
+    for item_id in sorted(common_ids):
+        cur = current_by_id[item_id]
+        bak = backup_by_id[item_id]
+        all_keys = set(cur.keys()) | set(bak.keys())
+        changes = []
+        for key in sorted(all_keys):
+            old_val = bak.get(key)
+            new_val = cur.get(key)
+            if old_val != new_val:
+                changes.append({"field": key, "old": old_val, "new": new_val})
+        if changes:
+            modified.append({
+                "id": item_id,
+                "name": cur.get(name_field, item_id),
+                "changes": changes,
+            })
+
+    return added, removed, modified
+
+
+def _diff_to_dict(current_data, backup_data, type_config):
+    """生成完整 diff 结果字典"""
+    result = {}
+    for data_type, name_field in type_config.items():
+        cur = current_data.get(data_type, [])
+        bak = backup_data.get(data_type, [])
+        added, removed, modified = _diff_data_type(cur, bak, name_field)
+        result[data_type] = {
+            "added": added,
+            "removed": removed,
+            "modified": modified,
+            "counts": {
+                "added": len(added),
+                "removed": len(removed),
+                "modified": len(modified),
+            },
+        }
+    return result
+
+
+@report_cmd.command("diff")
+@click.argument("backup_file", type=click.Path(exists=True))
+@click.option("--type", "-t", "diff_type", default="all",
+              type=click.Choice(["all", "teams", "players", "tournaments", "matches", "schedules"]),
+              help="只对比指定类型")
+@click.option("--output", "-O", "output_path", default="", help="导出到文件 (.md 或 .json)")
+@pass_context
+def report_diff(ctx, backup_file, diff_type, output_path):
+    """数据审计对比：当前数据 vs 备份文件 diff"""
+    import json
+
+    type_names = {
+        "teams": "队伍",
+        "players": "选手",
+        "tournaments": "赛事",
+        "matches": "比赛",
+        "schedules": "赛程",
+    }
+    name_fields = {
+        "teams": "name",
+        "players": "name",
+        "tournaments": "name",
+        "matches": "id",
+        "schedules": "id",
+    }
+
+    try:
+        with open(backup_file, "r", encoding="utf-8") as f:
+            backup_data = json.load(f)
+    except Exception as e:
+        print_error(f"读取备份文件失败: {e}")
+        return
+
+    if "data" not in backup_data:
+        print_error("备份文件格式不正确：缺少 data 字段")
+        return
+
+    backup = backup_data.get("data", {})
+    created_at = backup_data.get("created_at", "未知")
+
+    current = {
+        "teams": ctx.db.load_teams(),
+        "players": ctx.db.load_players(),
+        "tournaments": ctx.db.load_tournaments(),
+        "matches": ctx.db.load_matches(),
+        "schedules": ctx.db.load_schedules(),
+    }
+
+    if diff_type == "all":
+        target_types = ["teams", "players", "tournaments", "matches", "schedules"]
+    else:
+        target_types = [diff_type]
+
+    diff_result = _diff_to_dict(current, backup, {t: name_fields[t] for t in target_types})
+
+    total_added = sum(diff_result[t]["counts"]["added"] for t in target_types)
+    total_removed = sum(diff_result[t]["counts"]["removed"] for t in target_types)
+    total_modified = sum(diff_result[t]["counts"]["modified"] for t in target_types)
+
+    if not output_path or not output_path.endswith(".json"):
+        print_info(f"备份文件: {backup_file}")
+        print_info(f"备份时间: {created_at}")
+        print_info("")
+
+        summary_rows = []
+        for t in target_types:
+            c = diff_result[t]["counts"]
+            summary_rows.append([
+                type_names.get(t, t),
+                str(len(current.get(t, []))),
+                str(len(backup.get(t, []))),
+                f"+{c['added']}",
+                f"-{c['removed']}",
+                f"~{c['modified']}",
+            ])
+
+        print_table(
+            "数据对比汇总",
+            ["数据类型", "当前数量", "备份数量", "新增", "删除", "修改"],
+            summary_rows + [
+                ["合计",
+                 str(sum(len(current.get(t, [])) for t in target_types)),
+                 str(sum(len(backup.get(t, [])) for t in target_types)),
+                 f"+{total_added}", f"-{total_removed}", f"~{total_modified}"]
+            ],
+            table_style=ctx.table_style,
+        )
+
+        for t in target_types:
+            dr = diff_result[t]
+            if dr["counts"]["added"] == 0 and dr["counts"]["removed"] == 0 and dr["counts"]["modified"] == 0:
+                continue
+
+            print_info("")
+            print_info(f"=== {type_names.get(t, t)} 详细变更 ===")
+
+            if dr["added"]:
+                print_success(f"  新增 {len(dr['added'])} 条:")
+                for item in dr["added"]:
+                    nf = name_fields.get(t, "name")
+                    print_success(f"    + {item.get(nf, item.get('id'))} ({item.get('id')})")
+
+            if dr["removed"]:
+                print_error(f"  删除 {len(dr['removed'])} 条:")
+                for item in dr["removed"]:
+                    nf = name_fields.get(t, "name")
+                    print_error(f"    - {item.get(nf, item.get('id'))} ({item.get('id')})")
+
+            if dr["modified"]:
+                print_warning(f"  修改 {len(dr['modified'])} 条:")
+                for m in dr["modified"]:
+                    print_warning(f"    ~ {m['name']} ({m['id']})")
+                    for ch in m["changes"][:5]:
+                        old_str = str(ch["old"]) if ch["old"] is not None else "(空)"
+                        new_str = str(ch["new"]) if ch["new"] is not None else "(空)"
+                        if len(old_str) > 30:
+                            old_str = old_str[:30] + "..."
+                        if len(new_str) > 30:
+                            new_str = new_str[:30] + "..."
+                        print_warning(f"      · {ch['field']}: {old_str} → {new_str}")
+                    if len(m["changes"]) > 5:
+                        print_warning(f"      · ... 还有 {len(m['changes']) - 5} 处变更")
+
+    if output_path:
+        out_path = Path(output_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if output_path.endswith(".json"):
+            export_data = {
+                "backup_file": backup_file,
+                "backup_created_at": created_at,
+                "diff_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "summary": {
+                    "added": total_added,
+                    "removed": total_removed,
+                    "modified": total_modified,
+                },
+                "types": {},
+            }
+            for t in target_types:
+                export_data["types"][t] = {
+                    "name": type_names.get(t, t),
+                    **diff_result[t],
+                }
+
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(export_data, f, ensure_ascii=False, indent=2)
+            print_success("")
+            print_success(f"JSON 对比报告已导出到: {out_path.resolve()}")
+
+        elif output_path.endswith(".md"):
+            lines = []
+            lines.append(f"# 数据审计对比报告")
+            lines.append("")
+            lines.append(f"- 备份文件: `{backup_file}`")
+            lines.append(f"- 备份时间: {created_at}")
+            lines.append(f"- 对比时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            lines.append("")
+            lines.append("## 汇总")
+            lines.append("")
+            lines.append("| 数据类型 | 当前数量 | 备份数量 | 新增 | 删除 | 修改 |")
+            lines.append("|----------|----------|----------|------|------|------|")
+            for t in target_types:
+                c = diff_result[t]["counts"]
+                lines.append(f"| {type_names.get(t, t)} | {len(current.get(t, []))} | {len(backup.get(t, []))} | {c['added']} | {c['removed']} | {c['modified']} |")
+            lines.append(f"| 合计 | {sum(len(current.get(t, [])) for t in target_types)} | {sum(len(backup.get(t, [])) for t in target_types)} | {total_added} | {total_removed} | {total_modified} |")
+            lines.append("")
+
+            for t in target_types:
+                dr = diff_result[t]
+                if dr["counts"]["added"] == 0 and dr["counts"]["removed"] == 0 and dr["counts"]["modified"] == 0:
+                    continue
+
+                lines.append(f"## {type_names.get(t, t)}")
+                lines.append("")
+
+                if dr["added"]:
+                    lines.append(f"### 新增 ({len(dr['added'])})")
+                    lines.append("")
+                    for item in dr["added"]:
+                        nf = name_fields.get(t, "name")
+                        lines.append(f"- **{item.get(nf, item.get('id'))}** (`{item.get('id')}`)")
+                    lines.append("")
+
+                if dr["removed"]:
+                    lines.append(f"### 删除 ({len(dr['removed'])})")
+                    lines.append("")
+                    for item in dr["removed"]:
+                        nf = name_fields.get(t, "name")
+                        lines.append(f"- ~~{item.get(nf, item.get('id'))}~~ (`{item.get('id')}`)")
+                    lines.append("")
+
+                if dr["modified"]:
+                    lines.append(f"### 修改 ({len(dr['modified'])})")
+                    lines.append("")
+                    for m in dr["modified"]:
+                        lines.append(f"#### {m['name']} (`{m['id']}`)")
+                        lines.append("")
+                        lines.append("| 字段 | 旧值 | 新值 |")
+                        lines.append("|------|------|------|")
+                        for ch in m["changes"]:
+                            old_str = str(ch["old"]) if ch["old"] is not None else "_(空)_"
+                            new_str = str(ch["new"]) if ch["new"] is not None else "_(空)_"
+                            lines.append(f"| {ch['field']} | {old_str} | {new_str} |")
+                        lines.append("")
+
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+            print_success("")
+            print_success(f"Markdown 对比报告已导出到: {out_path.resolve()}")
+
+        else:
+            print_error("不支持的导出格式，请使用 .md 或 .json 后缀")
 
 
 @report_cmd.command("logs")
@@ -1724,6 +2221,151 @@ def _generate_logs_markdown(logs):
         )
 
     return "\n".join(lines) + "\n"
+
+
+@report_cmd.command("undo-preview")
+@click.argument("log_id")
+@pass_context
+def report_undo_preview(ctx, log_id):
+    """撤销预览：查看手动撤销某条操作需要改回哪些数据（只读，不执行撤销）"""
+    logs = ctx.db.load_operation_logs()
+
+    log_entry = None
+    for log in logs:
+        if log.get("id") == log_id:
+            log_entry = log
+            break
+
+    if not log_entry:
+        print_error(f"未找到日志: {log_id}")
+        return
+
+    op = log_entry.get("operation", "")
+    data_type = log_entry.get("data_type", "")
+    before = log_entry.get("before_data")
+    after = log_entry.get("after_data")
+
+    type_names = {
+        "teams": "队伍",
+        "players": "选手",
+        "tournaments": "赛事",
+        "matches": "比赛",
+        "schedules": "赛程",
+    }
+
+    print_info(f"日志ID: {log_entry.get('id')}")
+    print_info(f"操作时间: {log_entry.get('timestamp')}")
+    print_info(f"操作账号: {log_entry.get('account_name', log_entry.get('account'))}")
+    print_info(f"操作类型: {op}")
+    print_info(f"数据类型: {type_names.get(data_type, data_type)}")
+    print_info(f"涉及数据ID: {', '.join(str(x) for x in log_entry.get('data_ids', []))}")
+    print_info(f"详情: {log_entry.get('details', '')}")
+    print_info("")
+    print_info("=" * 50)
+    print_warning("撤销预览（只读，不会执行任何修改）")
+    print_info("=" * 50)
+    print_info("")
+
+    if before is None and after is None:
+        print_warning("该日志没有记录变更前后数据，无法生成撤销预览。")
+        print_info("提示：较早的日志可能未记录详细变更数据。")
+        return
+
+    if op == "create":
+        print_warning("【撤销操作】删除以下新建的数据:")
+        if isinstance(after, dict):
+            print_info(f"  - ID: {after.get('id', '?')}")
+            name = after.get("name") or after.get("team_a_id", "") + " vs " + after.get("team_b_id", "")
+            print_info(f"    名称: {name}")
+        elif isinstance(after, list):
+            for item in after:
+                name = item.get("name", item.get("id", "?"))
+                print_info(f"  - {name} ({item.get('id', '?')})")
+        print_info("")
+        print_warning("注意：删除后相关引用（如比赛引用的队伍）可能会失效。")
+
+    elif op in ("edit", "score_update", "map_result"):
+        print_warning("【撤销操作】将以下字段改回原值:")
+        print_info("")
+
+        if isinstance(before, dict) and isinstance(after, dict):
+            all_keys = set(before.keys()) | set(after.keys())
+            changes = []
+            for key in sorted(all_keys):
+                old_val = before.get(key)
+                new_val = after.get(key)
+                if old_val != new_val:
+                    changes.append((key, old_val, new_val))
+
+            if not changes:
+                print_info("  （未检测到字段变化）")
+            else:
+                rows = []
+                for field, old_val, new_val in changes:
+                    old_str = str(old_val) if old_val is not None else "(空)"
+                    new_str = str(new_val) if new_val is not None else "(空)"
+                    if field == "maps" and isinstance(old_val, list):
+                        old_str = f"{len(old_val)} 张地图"
+                        new_str = f"{len(new_val)} 张地图"
+                    if len(old_str) > 40:
+                        old_str = old_str[:40] + "..."
+                    if len(new_str) > 40:
+                        new_str = new_str[:40] + "..."
+                    rows.append([field, old_str, new_str])
+
+                print_table(
+                    "变更字段对比",
+                    ["字段", "当前值（变更后）", "原值（撤销后）"],
+                    rows,
+                    table_style=ctx.table_style,
+                )
+        print_info("")
+        print_warning("注意：手动撤销时，请确保将对应字段改回原值。")
+
+    elif op == "import":
+        print_warning("【撤销操作】删除以下导入的数据:")
+        print_info("")
+
+        if isinstance(after, list):
+            for item in after:
+                name = item.get("name", item.get("id", "?"))
+                print_info(f"  - {name} ({item.get('id', '?')})")
+        elif isinstance(after, dict):
+            for dtype, items in after.items():
+                if isinstance(items, list) and items:
+                    print_info(f"  [{type_names.get(dtype, dtype)}]")
+                    for item in items[:10]:
+                        name = item.get("name", item.get("id", "?"))
+                        print_info(f"    - {name} ({item.get('id', '?')})")
+                    if len(items) > 10:
+                        print_info(f"    ... 还有 {len(items) - 10} 条")
+
+        print_info("")
+        print_warning("注意：删除导入数据前，请确认没有其他数据依赖这些记录。")
+
+    elif op == "restore":
+        print_warning("【撤销操作】将以下类型数据恢复到恢复前的状态:")
+        print_info("")
+
+        if isinstance(before, dict):
+            for dtype, data in before.items():
+                count = len(data) if isinstance(data, list) else 1
+                print_info(f"  - {type_names.get(dtype, dtype)}: 恢复为 {count} 条记录")
+
+        print_info("")
+        print_warning("注意：撤销恢复 = 重新执行恢复操作，但使用恢复前的旧数据。")
+        print_warning("建议：使用 `report backup` 先备份当前数据，再考虑是否撤销。")
+
+    else:
+        print_info(f"操作类型 '{op}' 的撤销预览暂不支持详细分析。")
+        if before is not None:
+            print_info("变更前数据已记录，可手动查看 before_data 字段。")
+
+    print_info("")
+    print_info("=" * 50)
+    print_info("提示：这是只读预览，系统不会自动执行撤销操作。")
+    print_info("如需撤销，请根据上述说明手动执行相应命令。")
+    print_info("=" * 50)
 
 
 @report_cmd.command("reminders")
