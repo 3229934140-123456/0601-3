@@ -15,6 +15,7 @@ from esports_cli.utils import (
     validate_datetime,
     check_tournament_exists,
     check_team_exists,
+    calculate_win_rate,
 )
 
 
@@ -95,6 +96,105 @@ def match_create(ctx, tournament, team_a, team_b, datetime_str, stage, bo):
     print_info(f"对阵: {team_a_info.get('name')} vs {team_b_info.get('name')}")
     print_info(f"时间: {normalized_dt}")
     print_info(f"已同步到赛程列表")
+
+
+@match_cmd.command("edit")
+@click.argument("match_id")
+@click.option("--datetime", "-d", help="比赛时间 (YYYY-MM-DD HH:MM)")
+@click.option("--stage", "-s", help="比赛阶段")
+@click.option("--bo", type=int, help="BO几")
+@click.option("--team-a", help="队伍A ID")
+@click.option("--team-b", help="队伍B ID")
+@click.option("--tournament", "-t", help="赛事ID")
+@pass_context
+def match_edit(ctx, match_id, datetime, stage, bo, team_a, team_b, tournament):
+    """修改比赛信息（自动同步到赛程）"""
+    matches = ctx.db.load_matches()
+    schedules = ctx.db.load_schedules()
+    teams = ctx.db.load_teams()
+    tournaments = ctx.db.load_tournaments()
+
+    match_data = None
+    match_idx = -1
+    for i, m in enumerate(matches):
+        if m.get("id") == match_id:
+            match_data = m
+            match_idx = i
+            break
+
+    if not match_data:
+        print_error(f"未找到比赛: {match_id}")
+        return
+
+    teams_map = {t["id"]: t for t in teams}
+    tour_map = {t["id"]: t for t in tournaments}
+
+    updates = {}
+
+    if tournament:
+        if tournament not in tour_map:
+            print_error(f"赛事不存在: {tournament}")
+            return
+        updates["tournament_id"] = tournament
+
+    if team_a:
+        if team_a not in teams_map:
+            print_error(f"队伍A不存在: {team_a}")
+            return
+        updates["team_a_id"] = team_a
+
+    if team_b:
+        if team_b not in teams_map:
+            print_error(f"队伍B不存在: {team_b}")
+            return
+        updates["team_b_id"] = team_b
+
+    if datetime:
+        valid, normalized_dt, date_part = validate_datetime(datetime)
+        if not valid:
+            print_error(f"时间格式不正确: {datetime}")
+            print_info("请使用格式: YYYY-MM-DD HH:MM 或 YYYY/MM/DD HH:MM")
+            return
+        updates["datetime"] = normalized_dt
+        updates["date"] = date_part
+
+    if stage:
+        updates["stage"] = stage
+
+    if bo is not None:
+        updates["bo"] = bo
+
+    if not updates:
+        print_warning("没有指定任何要修改的字段")
+        print_info("可用选项: --datetime, --stage, --bo, --team-a, --team-b, --tournament")
+        return
+
+    for key, value in updates.items():
+        match_data[key] = value
+
+    matches[match_idx] = match_data
+    ctx.db.save_matches(matches)
+
+    sched_idx = -1
+    for i, s in enumerate(schedules):
+        if s.get("id") == match_id:
+            sched_idx = i
+            break
+
+    if sched_idx >= 0:
+        sched_data = schedules[sched_idx]
+        sync_fields = ["tournament_id", "team_a_id", "team_b_id",
+                       "datetime", "date", "stage", "bo"]
+        for f in sync_fields:
+            if f in updates:
+                sched_data[f] = updates[f]
+        schedules[sched_idx] = sched_data
+        ctx.db.save_schedules(schedules)
+
+    print_success(f"比赛已更新: {match_id}")
+    for key, value in updates.items():
+        print_info(f"  {key}: {value}")
+    print_info("已同步更新赛程")
 
 
 @match_cmd.command("list")
@@ -729,3 +829,107 @@ def tournament_set_status(ctx, tournament_id, new_status):
         "cancelled": "已取消",
     }
     print_success(f"赛事状态已更新为: {status_map.get(new_status, new_status)}")
+
+
+@tournament_cmd.command("roster")
+@click.argument("tournament_id")
+@click.option("--region", "-r", help="按地区筛选")
+@click.option("--team-status", help="按队伍状态筛选")
+@pass_context
+def tournament_roster(ctx, tournament_id, region, team_status):
+    """查看赛事参赛名单与选手阵容"""
+    tournaments = ctx.db.load_tournaments()
+    teams_list = ctx.db.load_teams()
+    players = ctx.db.load_players()
+    matches = ctx.db.load_matches()
+
+    tour = next((t for t in tournaments if t.get("id") == tournament_id), None)
+    if not tour:
+        print_error(f"未找到赛事: {tournament_id}")
+        return
+
+    tour_team_ids = tour.get("teams", [])
+    teams = [t for t in teams_list if t.get("id") in tour_team_ids]
+
+    if region:
+        teams = [t for t in teams if t.get("region", "").lower() == region.lower()]
+
+    if team_status:
+        teams = [t for t in teams if t.get("status", "") == team_status]
+
+    if not teams:
+        print_info("没有符合条件的参赛队伍")
+        return
+
+    print_info("")
+    print_info(f"参赛队伍: {len(teams)} 支")
+    print_info("=" * 60)
+
+    for t in teams:
+        team_id = t.get("id")
+        team_players = [p for p in players if p.get("team_id") == team_id]
+        suspended_count = sum(1 for p in team_players if p.get("status") == "suspended")
+        active_players = [p for p in team_players if p.get("status") != "suspended"]
+
+        team_wins = 0
+        team_losses = 0
+        for m in matches:
+            if m.get("status") != "finished":
+                continue
+            if m.get("tournament_id") != tournament_id:
+                continue
+            is_a = m.get("team_a_id") == team_id
+            is_b = m.get("team_b_id") == team_id
+            if not (is_a or is_b):
+                continue
+            s_a = m.get("score_a", 0)
+            s_b = m.get("score_b", 0)
+            if is_a:
+                if s_a > s_b:
+                    team_wins += 1
+                elif s_a < s_b:
+                    team_losses += 1
+            else:
+                if s_b > s_a:
+                    team_wins += 1
+                elif s_b < s_a:
+                    team_losses += 1
+
+        form = []
+        team_matches = [m for m in matches
+                        if m.get("status") == "finished"
+                        and m.get("tournament_id") == tournament_id
+                        and (m.get("team_a_id") == team_id or m.get("team_b_id") == team_id)]
+        team_matches.sort(key=lambda x: x.get("datetime", ""), reverse=True)
+        for m in team_matches[:5]:
+            is_a = m.get("team_a_id") == team_id
+            my_s = m.get("score_a", 0) if is_a else m.get("score_b", 0)
+            opp_s = m.get("score_b", 0) if is_a else m.get("score_a", 0)
+            form.append("胜" if my_s > opp_s else "负")
+        form_str = " ".join(form) if form else "-"
+
+        print_info("")
+        print_info(f"【{t.get('name', '')}】 ({t.get('short_name', '')})")
+        print_info(f"  地区: {t.get('region', '-')} | 教练: {t.get('coach', '-')}")
+        print_info(f"  战绩: {team_wins}胜 {team_losses}负 "
+                   f"| 胜率: {calculate_win_rate(team_wins, team_losses)}")
+        print_info(f"  近期走势: {form_str}")
+        print_info(f"  选手: {len(active_players)} 人注册，{suspended_count} 人禁赛")
+
+        if active_players:
+            print_info(f"  阵容:")
+            for p in active_players[:6]:
+                stats = p.get("stats", {})
+                kills = stats.get("kills", 0)
+                deaths = stats.get("deaths", 0)
+                assists = stats.get("assists", 0)
+                kda = (kills + assists) / deaths if deaths > 0 else float(kills + assists)
+                print_info(f"    {p.get('ingame_id', ''):<10} "
+                           f"{p.get('name', ''):<6} "
+                           f"{p.get('role', ''):<6} "
+                           f"KDA: {kda:.2f}")
+            if len(active_players) > 6:
+                print_info(f"    ... 还有 {len(active_players) - 6} 名选手")
+
+    print_info("")
+    print_info("=" * 60)

@@ -21,10 +21,12 @@ def rank_cmd():
 @rank_cmd.command("standings")
 @click.option("--tournament", "-t", help="赛事ID")
 @click.option("--sort-by", "-s", default="points",
-              type=click.Choice(["points", "wins", "win_rate", "net_score"]),
-              help="排序方式")
+              type=click.Choice(["points", "wins", "win_rate", "net_score", "map_diff", "h2h"]),
+              help="主排序规则")
+@click.option("--tiebreaker", "-b", default="map_diff,wins,h2h",
+              help="并列排名规则，逗号分隔，可选: wins, net_score, map_diff, h2h, win_rate")
 @pass_context
-def rank_standings(ctx, tournament, sort_by):
+def rank_standings(ctx, tournament, sort_by, tiebreaker):
     """查看赛事积分榜"""
     teams = ctx.db.load_teams()
     matches = ctx.db.load_matches()
@@ -46,14 +48,19 @@ def rank_standings(ctx, tournament, sort_by):
         print_info("暂无队伍数据")
         return
 
+    team_ids = [t.get("id") for t in team_list]
+
     standings = []
     for team in team_list:
         team_id = team.get("id")
         wins = 0
         losses = 0
+        draws = 0
         points = 0
         score_for = 0
         score_against = 0
+        map_wins = 0
+        map_losses = 0
 
         for m in matches:
             if m.get("status") != "finished":
@@ -70,6 +77,17 @@ def rank_standings(ctx, tournament, sort_by):
             s_a = m.get("score_a", 0)
             s_b = m.get("score_b", 0)
 
+            maps = m.get("maps", [])
+            for mp in maps:
+                ms_a = mp.get("score_a", 0)
+                ms_b = mp.get("score_b", 0)
+                if is_team_a:
+                    map_wins += ms_a
+                    map_losses += ms_b
+                else:
+                    map_wins += ms_b
+                    map_losses += ms_a
+
             if is_team_a:
                 score_for += s_a
                 score_against += s_b
@@ -79,6 +97,7 @@ def rank_standings(ctx, tournament, sort_by):
                 elif s_a < s_b:
                     losses += 1
                 else:
+                    draws += 1
                     points += 1
             else:
                 score_for += s_b
@@ -89,10 +108,43 @@ def rank_standings(ctx, tournament, sort_by):
                 elif s_b < s_a:
                     losses += 1
                 else:
+                    draws += 1
                     points += 1
 
         net_score = score_for - score_against
+        map_diff = map_wins - map_losses
         win_rate = calculate_win_rate(wins, losses)
+        win_rate_value = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
+
+        h2h = {}
+        for other_id in team_ids:
+            if other_id == team_id:
+                continue
+            h2h_wins = 0
+            h2h_losses = 0
+            for m in matches:
+                if m.get("status") != "finished":
+                    continue
+                if tournament and m.get("tournament_id") != tournament:
+                    continue
+                a = m.get("team_a_id")
+                b = m.get("team_b_id")
+                if not ((a == team_id and b == other_id) or
+                        (a == other_id and b == team_id)):
+                    continue
+                s_a = m.get("score_a", 0)
+                s_b = m.get("score_b", 0)
+                if a == team_id:
+                    if s_a > s_b:
+                        h2h_wins += 1
+                    elif s_a < s_b:
+                        h2h_losses += 1
+                else:
+                    if s_b > s_a:
+                        h2h_wins += 1
+                    elif s_b < s_a:
+                        h2h_losses += 1
+            h2h[other_id] = {"wins": h2h_wins, "losses": h2h_losses}
 
         standings.append({
             "team_id": team_id,
@@ -100,21 +152,71 @@ def rank_standings(ctx, tournament, sort_by):
             "short_name": team.get("short_name", "-"),
             "wins": wins,
             "losses": losses,
+            "draws": draws,
             "points": points,
             "score_for": score_for,
             "score_against": score_against,
             "net_score": net_score,
+            "map_wins": map_wins,
+            "map_losses": map_losses,
+            "map_diff": map_diff,
             "win_rate": win_rate,
-            "win_rate_value": (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0,
+            "win_rate_value": win_rate_value,
+            "h2h": h2h,
         })
 
-    sort_keys = {
-        "points": lambda x: (-x["points"], -x["wins"], -x["net_score"]),
-        "wins": lambda x: (-x["wins"], -x["points"], -x["net_score"]),
-        "win_rate": lambda x: (-x["win_rate_value"], -x["wins"], -x["points"]),
-        "net_score": lambda x: (-x["net_score"], -x["wins"], -x["points"]),
-    }
-    standings.sort(key=sort_keys[sort_by])
+    tb_rules = [r.strip() for r in tiebreaker.split(",") if r.strip()]
+
+    def build_sort_key(team):
+        primary = 0
+        if sort_by == "points":
+            primary = -team["points"]
+        elif sort_by == "wins":
+            primary = -team["wins"]
+        elif sort_by == "win_rate":
+            primary = -team["win_rate_value"]
+        elif sort_by == "net_score":
+            primary = -team["net_score"]
+        elif sort_by == "map_diff":
+            primary = -team["map_diff"]
+        return primary
+
+    def get_tb_value(team, rule):
+        if rule == "wins":
+            return -team["wins"]
+        elif rule == "net_score":
+            return -team["net_score"]
+        elif rule == "map_diff":
+            return -team["map_diff"]
+        elif rule == "win_rate":
+            return -team["win_rate_value"]
+        elif rule == "h2h":
+            return 0
+        return 0
+
+    def compare_teams(a, b):
+        a_primary = build_sort_key(a)
+        b_primary = build_sort_key(b)
+        if a_primary != b_primary:
+            return -1 if a_primary < b_primary else 1
+
+        for rule in tb_rules:
+            if rule == "h2h":
+                a_h2h = a["h2h"].get(b["team_id"], {"wins": 0, "losses": 0})
+                a_w = a_h2h["wins"]
+                a_l = a_h2h["losses"]
+                b_w = a_l
+                if a_w != b_w:
+                    return -1 if a_w > b_w else 1
+            else:
+                a_val = get_tb_value(a, rule)
+                b_val = get_tb_value(b, rule)
+                if a_val != b_val:
+                    return -1 if a_val < b_val else 1
+        return 0
+
+    import functools
+    standings.sort(key=functools.cmp_to_key(compare_teams))
 
     rows = []
     for i, s in enumerate(standings, 1):
@@ -128,25 +230,39 @@ def rank_standings(ctx, tournament, sort_by):
 
         rank_display = f"{i} {rank_tag}" if rank_tag else str(i)
 
+        reason_parts = []
+        reason_parts.append(f"积分{s['points']}")
+        if "map_diff" in tb_rules:
+            reason_parts.append(f"净胜图{s['map_diff']:+d}")
+        if "wins" in tb_rules:
+            reason_parts.append(f"{s['wins']}胜")
+        if "net_score" in tb_rules:
+            reason_parts.append(f"净胜分{s['net_score']:+d}")
+        reason = " | ".join(reason_parts)
+
         rows.append([
             rank_display,
             s["team_name"],
             str(s["wins"]),
             str(s["losses"]),
             s["win_rate"],
+            f"{s['map_wins']}-{s['map_losses']}",
+            f"{s['map_diff']:+d}",
             str(s["score_for"]),
             str(s["score_against"]),
             f"{s['net_score']:+d}",
             str(s["points"]),
+            reason,
         ])
 
     print_table(
         f"积分榜 - {tour_name}",
-        ["排名", "队伍", "胜", "负", "胜率", "得分", "失分", "净胜分", "积分"],
+        ["排名", "队伍", "胜", "负", "胜率", "地图胜-负", "净胜图", "得分", "失分", "净胜分", "积分", "排名依据"],
         rows,
         table_style=ctx.table_style,
     )
     print_info(f"共 {len(standings)} 支队伍")
+    print_info(f"排序规则: 主规则={sort_by}, 并列规则={tiebreaker}")
 
 
 @rank_cmd.command("win-rate")

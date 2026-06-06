@@ -7,6 +7,7 @@ from esports_cli.utils import (
     print_table,
     print_success,
     print_error,
+    print_warning,
     print_info,
     format_date,
     format_datetime,
@@ -182,6 +183,105 @@ def schedule_add(ctx, tournament, team_a, team_b, datetime_str, stage, bo):
     print_info(f"对阵: {team_a_info.get('name')} vs {team_b_info.get('name')}")
     print_info(f"时间: {normalized_dt}")
     print_info(f"已同步到比赛记录，可使用 match score/map-result 录入结果")
+
+
+@schedule_cmd.command("edit")
+@click.argument("schedule_id")
+@click.option("--datetime", "-d", help="比赛时间 (YYYY-MM-DD HH:MM)")
+@click.option("--stage", "-s", help="比赛阶段")
+@click.option("--bo", type=int, help="BO几")
+@click.option("--team-a", help="队伍A ID")
+@click.option("--team-b", help="队伍B ID")
+@click.option("--tournament", "-t", help="赛事ID")
+@pass_context
+def schedule_edit(ctx, schedule_id, datetime, stage, bo, team_a, team_b, tournament):
+    """修改赛程信息（自动同步到比赛记录）"""
+    schedules = ctx.db.load_schedules()
+    matches = ctx.db.load_matches()
+    teams = ctx.db.load_teams()
+    tournaments = ctx.db.load_tournaments()
+
+    sched_data = None
+    sched_idx = -1
+    for i, s in enumerate(schedules):
+        if s.get("id") == schedule_id:
+            sched_data = s
+            sched_idx = i
+            break
+
+    if not sched_data:
+        print_error(f"未找到赛程: {schedule_id}")
+        return
+
+    teams_map = {t["id"]: t for t in teams}
+    tour_map = {t["id"]: t for t in tournaments}
+
+    updates = {}
+
+    if tournament:
+        if tournament not in tour_map:
+            print_error(f"赛事不存在: {tournament}")
+            return
+        updates["tournament_id"] = tournament
+
+    if team_a:
+        if team_a not in teams_map:
+            print_error(f"队伍A不存在: {team_a}")
+            return
+        updates["team_a_id"] = team_a
+
+    if team_b:
+        if team_b not in teams_map:
+            print_error(f"队伍B不存在: {team_b}")
+            return
+        updates["team_b_id"] = team_b
+
+    if datetime:
+        valid, normalized_dt, date_part = validate_datetime(datetime)
+        if not valid:
+            print_error(f"时间格式不正确: {datetime}")
+            print_info("请使用格式: YYYY-MM-DD HH:MM 或 YYYY/MM/DD HH:MM")
+            return
+        updates["datetime"] = normalized_dt
+        updates["date"] = date_part
+
+    if stage:
+        updates["stage"] = stage
+
+    if bo is not None:
+        updates["bo"] = bo
+
+    if not updates:
+        print_warning("没有指定任何要修改的字段")
+        print_info("可用选项: --datetime, --stage, --bo, --team-a, --team-b, --tournament")
+        return
+
+    for key, value in updates.items():
+        sched_data[key] = value
+
+    schedules[sched_idx] = sched_data
+    ctx.db.save_schedules(schedules)
+
+    match_idx = -1
+    for i, m in enumerate(matches):
+        if m.get("id") == schedule_id:
+            match_idx = i
+            break
+
+    if match_idx >= 0:
+        match_data = matches[match_idx]
+        sync_fields = ["tournament_id", "team_a_id", "team_b_id",
+                       "datetime", "date", "stage", "bo"]
+        for f in sync_fields:
+            if f in updates:
+                match_data[f] = updates[f]
+        matches[match_idx] = match_data
+        ctx.db.save_matches(matches)
+
+    print_success(f"赛程已更新: {schedule_id}")
+    for key, value in updates.items():
+        print_info(f"  {key}: {value}")
+    print_info("已同步更新比赛记录")
 
 
 @schedule_cmd.command("reminders")

@@ -1,0 +1,5 @@
+[
+  {"id": "T901", "name": "测试战队1", "short_name": "TEST1", "region": "华北", "coach": "张教练"},
+  {"id": "T902", "name": "测试战队2", "short_name": "TEST2", "region": "华南", "coach": "李教练"},
+  {"id": "T901", "name": "重复战队", "short_name": "DUP", "region": "华东", "coach": "王教练"}
+]
