@@ -1,0 +1,151 @@
+[
+  {
+    "id": "T001",
+    "name": "烈焰战队",
+    "short_name": "FLA",
+    "region": "华东",
+    "coach": "张教练",
+    "manager": "王经理",
+    "home_stadium": "上海电竞中心",
+    "founded": "2020-03-15",
+    "stats": {
+      "wins": 42,
+      "losses": 18,
+      "total_matches": 60
+    },
+    "achievements": [
+      "2023春季赛冠军",
+      "2022夏季赛季军",
+      "2021年度最佳战队"
+    ],
+    "roster_changes": []
+  },
+  {
+    "id": "T002",
+    "name": "风暴电竞",
+    "short_name": "STO",
+    "region": "华北",
+    "coach": "李教练",
+    "manager": "刘经理",
+    "home_stadium": "北京电竞馆",
+    "founded": "2019-06-20",
+    "stats": {
+      "wins": 38,
+      "losses": 22,
+      "total_matches": 60
+    },
+    "achievements": [
+      "2023夏季赛亚军",
+      "2022春季赛四强"
+    ],
+    "roster_changes": []
+  },
+  {
+    "id": "T003",
+    "name": "闪电狼",
+    "short_name": "WOL",
+    "region": "华南",
+    "coach": "陈教练",
+    "manager": "赵经理",
+    "home_stadium": "广州竞技场",
+    "founded": "2021-01-10",
+    "stats": {
+      "wins": 35,
+      "losses": 25,
+      "total_matches": 60
+    },
+    "achievements": [
+      "2023春季赛季军"
+    ],
+    "roster_changes": []
+  },
+  {
+    "id": "T004",
+    "name": "星辰战队",
+    "short_name": "STA",
+    "region": "西南",
+    "coach": "周教练",
+    "manager": "吴经理",
+    "home_stadium": "成都电竞中心",
+    "founded": "2020-08-05",
+    "stats": {
+      "wins": 30,
+      "losses": 30,
+      "total_matches": 60
+    },
+    "achievements": [],
+    "roster_changes": []
+  },
+  {
+    "id": "T005",
+    "name": "猛虎突击队",
+    "short_name": "TGR",
+    "region": "东北",
+    "coach": "孙教练",
+    "manager": "郑经理",
+    "home_stadium": "沈阳电竞馆",
+    "founded": "2019-11-20",
+    "stats": {
+      "wins": 28,
+      "losses": 32,
+      "total_matches": 60
+    },
+    "achievements": [],
+    "roster_changes": []
+  },
+  {
+    "id": "T006",
+    "name": "龙魂战队",
+    "short_name": "DRG",
+    "region": "华中",
+    "coach": "杨教练",
+    "manager": "黄经理",
+    "home_stadium": "武汉电竞中心",
+    "founded": "2022-02-14",
+    "stats": {
+      "wins": 25,
+      "losses": 20,
+      "total_matches": 45
+    },
+    "achievements": [
+      "2023夏季赛黑马战队"
+    ],
+    "roster_changes": []
+  },
+  {
+    "id": "T007",
+    "name": "夜鹰战队",
+    "short_name": "NYG",
+    "region": "西北",
+    "coach": "胡教练",
+    "manager": "林经理",
+    "home_stadium": "西安电竞馆",
+    "founded": "2021-09-01",
+    "stats": {
+      "wins": 22,
+      "losses": 28,
+      "total_matches": 50
+    },
+    "achievements": [],
+    "roster_changes": []
+  },
+  {
+    "id": "T008",
+    "name": "幻影军团",
+    "short_name": "PHN",
+    "region": "华东",
+    "coach": "何教练",
+    "manager": "高经理",
+    "home_stadium": "杭州电竞中心",
+    "founded": "2020-05-18",
+    "stats": {
+      "wins": 32,
+      "losses": 25,
+      "total_matches": 57
+    },
+    "achievements": [
+      "2022夏季赛亚军"
+    ],
+    "roster_changes": []
+  }
+]

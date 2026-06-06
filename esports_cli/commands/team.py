@@ -10,6 +10,7 @@ from esports_cli.utils import (
     print_warning,
     print_info,
     print_panel,
+    format_date,
     calculate_win_rate,
 )
 
@@ -66,6 +67,7 @@ def team_list(ctx, tournament, region):
         "队伍列表",
         ["队伍ID", "名称", "简称", "地区", "教练", "胜", "负", "胜率"],
         rows,
+        table_style=ctx.table_style,
     )
     print_info(f"共 {len(filtered)} 支队伍")
 
@@ -251,7 +253,7 @@ def roster_history(ctx, team_id, limit):
     rows = []
     for c in changes:
         rows.append([
-            c.get("date", "-"),
+            format_date(c.get("date", "-"), ctx.date_fmt),
             c.get("player_name", "-"),
             c.get("action_display", c.get("action", "-")),
             c.get("reason", "-"),
@@ -261,6 +263,7 @@ def roster_history(ctx, team_id, limit):
         f"阵容变更历史 - {team_data.get('name', '')}",
         ["日期", "选手", "变更类型", "原因"],
         rows,
+        table_style=ctx.table_style,
     )
 
 
@@ -308,7 +311,7 @@ def scrim_list(ctx, team, date, limit):
 
         rows.append([
             s.get("id", "-"),
-            s.get("date", "-"),
+            format_date(s.get("date", "-"), ctx.date_fmt),
             team_a,
             f"{s.get('score_a', 0)}:{s.get('score_b', 0)}",
             team_b,
@@ -320,6 +323,7 @@ def scrim_list(ctx, team, date, limit):
         "训练赛记录",
         ["记录ID", "日期", "队伍A", "比分", "队伍B", "结果", "备注"],
         rows,
+        table_style=ctx.table_style,
     )
 
 

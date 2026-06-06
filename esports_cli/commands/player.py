@@ -75,6 +75,7 @@ def player_list(ctx, team, role, status, nation):
         "选手列表",
         ["选手ID", "游戏ID", "姓名", "队伍", "角色", "状态", "国籍"],
         rows,
+        table_style=ctx.table_style,
     )
     print_info(f"共 {len(filtered)} 名选手")
 

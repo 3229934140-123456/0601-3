@@ -8,7 +8,11 @@ from esports_cli.utils import (
     print_success,
     print_error,
     print_info,
+    format_date,
     format_datetime,
+    validate_datetime,
+    check_tournament_exists,
+    check_team_exists,
 )
 
 
@@ -87,7 +91,7 @@ def schedule_list(ctx, tournament, date, team, upcoming, past):
 
         rows.append([
             s.get("id", "-"),
-            s.get("datetime", "-"),
+            format_datetime(s.get("datetime", "-"), ctx.date_fmt),
             tour_name,
             f"{team_a} vs {team_b}",
             s.get("stage", "-"),
@@ -103,6 +107,7 @@ def schedule_list(ctx, tournament, date, team, upcoming, past):
         title,
         ["比赛ID", "时间", "赛事", "对阵", "阶段", "状态"],
         rows,
+        table_style=ctx.table_style,
     )
     print_info(f"共 {len(filtered)} 场比赛")
 
@@ -113,11 +118,35 @@ def schedule_list(ctx, tournament, date, team, upcoming, past):
 @click.option("--team-b", "-b", required=True, help="队伍B ID")
 @click.option("--datetime", "-d", "datetime_str", required=True, help="比赛时间 (YYYY-MM-DD HH:MM)")
 @click.option("--stage", "-s", default="常规赛", help="比赛阶段")
-@click.option("--bo", default=3, help="BO几")
+@click.option("--bo", default=3, type=int, help="BO几")
 @pass_context
 def schedule_add(ctx, tournament, team_a, team_b, datetime_str, stage, bo):
-    """添加赛程"""
+    """添加赛程（自动同步到比赛记录）"""
     schedules = ctx.db.load_schedules()
+    matches = ctx.db.load_matches()
+    tournaments = ctx.db.load_tournaments()
+    teams = ctx.db.load_teams()
+
+    tour_exists, tour_info = check_tournament_exists(tournaments, tournament)
+    if not tour_exists:
+        print_error(f"赛事不存在: {tournament}")
+        return
+
+    team_a_exists, team_a_info = check_team_exists(teams, team_a)
+    if not team_a_exists:
+        print_error(f"队伍A不存在: {team_a}")
+        return
+
+    team_b_exists, team_b_info = check_team_exists(teams, team_b)
+    if not team_b_exists:
+        print_error(f"队伍B不存在: {team_b}")
+        return
+
+    valid, normalized_dt, date_part = validate_datetime(datetime_str)
+    if not valid:
+        print_error(f"时间格式不正确: {datetime_str}")
+        print_info("请使用格式: YYYY-MM-DD HH:MM 或 YYYY/MM/DD HH:MM")
+        return
 
     match_id = generate_id("M")
     schedule = {
@@ -125,8 +154,8 @@ def schedule_add(ctx, tournament, team_a, team_b, datetime_str, stage, bo):
         "tournament_id": tournament,
         "team_a_id": team_a,
         "team_b_id": team_b,
-        "datetime": datetime_str,
-        "date": datetime_str.split()[0] if " " in datetime_str else datetime_str,
+        "datetime": normalized_dt,
+        "date": date_part,
         "stage": stage,
         "bo": bo,
         "status": "scheduled",
@@ -136,8 +165,23 @@ def schedule_add(ctx, tournament, team_a, team_b, datetime_str, stage, bo):
     }
 
     schedules.append(schedule)
+
+    match_data = dict(schedule)
+    match_data.update({
+        "mvp": "",
+        "duration": "",
+        "notes": "",
+        "type": "official",
+    })
+    matches.append(match_data)
+
     ctx.db.save_schedules(schedules)
+    ctx.db.save_matches(matches)
+
     print_success(f"赛程已添加: {match_id}")
+    print_info(f"对阵: {team_a_info.get('name')} vs {team_b_info.get('name')}")
+    print_info(f"时间: {normalized_dt}")
+    print_info(f"已同步到比赛记录，可使用 match score/map-result 录入结果")
 
 
 @schedule_cmd.command("reminders")
@@ -182,7 +226,7 @@ def schedule_reminders(ctx, hours):
         rows.append([
             s.get("id", "-"),
             f"{hours_remaining}小时{minutes_remaining}分钟后",
-            s.get("datetime", "-"),
+            format_datetime(s.get("datetime", "-"), ctx.date_fmt),
             f"{team_a} vs {team_b}",
             tour_name,
         ])
@@ -191,6 +235,7 @@ def schedule_reminders(ctx, hours):
         f"即将开始的比赛 (未来{hours}小时)",
         ["比赛ID", "倒计时", "开始时间", "对阵", "赛事"],
         rows,
+        table_style=ctx.table_style,
     )
     print_info(f"共 {len(upcoming)} 场比赛即将开始")
 
@@ -200,6 +245,7 @@ def schedule_reminders(ctx, hours):
 def schedule_today(ctx):
     """查看今日赛程"""
     today_str = datetime.now().strftime("%Y-%m-%d")
+    today_display = format_date(today_str, ctx.date_fmt)
     schedules = ctx.db.load_schedules()
     teams = {t["id"]: t for t in ctx.db.load_teams()}
     tournaments = {t["id"]: t for t in ctx.db.load_tournaments()}
@@ -233,7 +279,8 @@ def schedule_today(ctx):
         ])
 
     print_table(
-        f"今日赛程 ({today_str})",
+        f"今日赛程 ({today_display})",
         ["比赛ID", "时间", "对阵", "赛事", "阶段", "状态"],
         rows,
+        table_style=ctx.table_style,
     )

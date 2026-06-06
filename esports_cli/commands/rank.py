@@ -144,6 +144,7 @@ def rank_standings(ctx, tournament, sort_by):
         f"积分榜 - {tour_name}",
         ["排名", "队伍", "胜", "负", "胜率", "得分", "失分", "净胜分", "积分"],
         rows,
+        table_style=ctx.table_style,
     )
     print_info(f"共 {len(standings)} 支队伍")
 
@@ -236,6 +237,7 @@ def rank_win_rate(ctx, tournament, team, top):
         "胜率排行榜",
         ["排名", "队伍", "胜", "负", "总场次", "胜率", "趋势"],
         rows,
+        table_style=ctx.table_style,
     )
 
 
@@ -250,11 +252,30 @@ def rank_win_rate(ctx, tournament, team, top):
 def rank_player_stats(ctx, tournament, team, sort_by, top):
     """查看选手数据排行"""
     players = ctx.db.load_players()
-    teams = {t["id"]: t for t in ctx.db.load_teams()}
+    teams_list = ctx.db.load_teams()
+    teams = {t["id"]: t for t in teams_list}
+    tournaments = ctx.db.load_tournaments()
 
     filtered = players
+
+    if tournament:
+        tour = next((t for t in tournaments if t.get("id") == tournament), None)
+        if not tour:
+            print_error(f"未找到赛事: {tournament}")
+            return
+        tour_team_ids = tour.get("teams", [])
+        filtered = [p for p in filtered if p.get("team_id") in tour_team_ids]
+
     if team:
         filtered = [p for p in filtered if p.get("team_id") == team]
+
+    title = "选手数据排行"
+    if tournament:
+        tour_name = next((t.get("name", tournament) for t in tournaments if t.get("id") == tournament), tournament)
+        title += f" - {tour_name}"
+    if team:
+        team_name = teams.get(team, {}).get("name", team)
+        title += f" - {team_name}"
 
     player_list = []
     for p in filtered:
@@ -305,9 +326,10 @@ def rank_player_stats(ctx, tournament, team, sort_by, top):
         ])
 
     print_table(
-        "选手数据排行",
+        title,
         ["排名", "游戏ID", "姓名", "队伍", "角色", "击杀", "死亡", "助攻", "KDA"],
         rows,
+        table_style=ctx.table_style,
     )
 
 
