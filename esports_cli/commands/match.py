@@ -16,6 +16,8 @@ from esports_cli.utils import (
     check_tournament_exists,
     check_team_exists,
     calculate_win_rate,
+    validate_match_for_stage,
+    log_operation,
 )
 
 
@@ -30,7 +32,7 @@ def match_cmd():
 @click.option("--team-a", "-a", required=True, help="队伍A ID")
 @click.option("--team-b", "-b", required=True, help="队伍B ID")
 @click.option("--datetime", "-d", "datetime_str", default=None, help="比赛时间 (YYYY-MM-DD HH:MM)")
-@click.option("--stage", "-s", default="常规赛", help="比赛阶段")
+@click.option("--stage", "-s", default="", help="比赛阶段（指定时自动校验）")
 @click.option("--bo", default=3, type=int, help="BO几")
 @pass_context
 def match_create(ctx, tournament, team_a, team_b, datetime_str, stage, bo):
@@ -64,6 +66,14 @@ def match_create(ctx, tournament, team_a, team_b, datetime_str, stage, bo):
         print_info("请使用格式: YYYY-MM-DD HH:MM 或 YYYY/MM/DD HH:MM")
         return
 
+    if stage:
+        valid_stage, stage_err = validate_match_for_stage(
+            tour_info, stage, date_part, team_a, team_b
+        )
+        if not valid_stage:
+            print_error(f"阶段校验失败: {stage_err}")
+            return
+
     match_id = generate_id("M")
     match_data = {
         "id": match_id,
@@ -91,6 +101,10 @@ def match_create(ctx, tournament, team_a, team_b, datetime_str, stage, bo):
 
     ctx.db.save_matches(matches)
     ctx.db.save_schedules(schedules)
+
+    settings = ctx.db.load_settings()
+    log_operation(ctx.db, settings, "create", "match", [match_id],
+                  f"{team_a_info.get('name')} vs {team_b_info.get('name')}, BO{bo}, {stage}")
 
     print_success(f"比赛创建成功: {match_id}")
     print_info(f"对阵: {team_a_info.get('name')} vs {team_b_info.get('name')}")
@@ -169,6 +183,21 @@ def match_edit(ctx, match_id, datetime, stage, bo, team_a, team_b, tournament):
         print_info("可用选项: --datetime, --stage, --bo, --team-a, --team-b, --tournament")
         return
 
+    final_tour_id = updates.get("tournament_id", match_data.get("tournament_id"))
+    final_stage = updates.get("stage", match_data.get("stage", ""))
+    final_date = updates.get("date", match_data.get("date", ""))
+    final_team_a = updates.get("team_a_id", match_data.get("team_a_id", ""))
+    final_team_b = updates.get("team_b_id", match_data.get("team_b_id", ""))
+
+    if final_stage:
+        final_tour = tour_map.get(final_tour_id)
+        valid_stage, stage_err = validate_match_for_stage(
+            final_tour, final_stage, final_date, final_team_a, final_team_b
+        )
+        if not valid_stage:
+            print_error(f"阶段校验失败: {stage_err}")
+            return
+
     for key, value in updates.items():
         match_data[key] = value
 
@@ -190,6 +219,10 @@ def match_edit(ctx, match_id, datetime, stage, bo, team_a, team_b, tournament):
                 sched_data[f] = updates[f]
         schedules[sched_idx] = sched_data
         ctx.db.save_schedules(schedules)
+
+    settings = ctx.db.load_settings()
+    detail_str = ", ".join(f"{k}={v}" for k, v in updates.items())
+    log_operation(ctx.db, settings, "edit", "match", [match_id], detail_str)
 
     print_success(f"比赛已更新: {match_id}")
     for key, value in updates.items():
@@ -355,6 +388,13 @@ def match_score(ctx, match_id, score_a, score_b, mvp):
 
     ctx.db.save_matches(matches)
     ctx.db.save_schedules(schedules)
+
+    settings = ctx.db.load_settings()
+    detail = f"比分 {score_a}:{score_b}"
+    if mvp:
+        detail += f", MVP: {mvp}"
+    log_operation(ctx.db, settings, "score_update", "match", [match_id], detail)
+
     print_success(f"比分已更新: {score_a} : {score_b}")
     print_info("已同步到赛程列表")
 
@@ -835,8 +875,10 @@ def tournament_set_status(ctx, tournament_id, new_status):
 @click.argument("tournament_id")
 @click.option("--region", "-r", help="按地区筛选")
 @click.option("--team-status", help="按队伍状态筛选")
+@click.option("--available-only", is_flag=True, help="只显示可出场选手")
+@click.option("--min-players", type=int, default=5, help="最低出场人数要求")
 @pass_context
-def tournament_roster(ctx, tournament_id, region, team_status):
+def tournament_roster(ctx, tournament_id, region, team_status, available_only, min_players):
     """查看赛事参赛名单与选手阵容"""
     tournaments = ctx.db.load_tournaments()
     teams_list = ctx.db.load_teams()
@@ -861,15 +903,37 @@ def tournament_roster(ctx, tournament_id, region, team_status):
         print_info("没有符合条件的参赛队伍")
         return
 
+    status_map = {
+        "active": "正常",
+        "suspended": "禁赛",
+        "injured": "受伤",
+        "substitute": "替补",
+    }
+
     print_info("")
     print_info(f"参赛队伍: {len(teams)} 支")
+    print_info(f"最低出场要求: {min_players} 人")
     print_info("=" * 60)
 
     for t in teams:
         team_id = t.get("id")
         team_players = [p for p in players if p.get("team_id") == team_id]
-        suspended_count = sum(1 for p in team_players if p.get("status") == "suspended")
-        active_players = [p for p in team_players if p.get("status") != "suspended"]
+        total_players = len(team_players)
+
+        status_counts = {}
+        for p in team_players:
+            s = p.get("status", "active")
+            status_counts[s] = status_counts.get(s, 0) + 1
+
+        suspended_count = status_counts.get("suspended", 0)
+        injured_count = status_counts.get("injured", 0)
+        substitute_count = status_counts.get("substitute", 0)
+        active_count = status_counts.get("active", 0)
+
+        available_players = [p for p in team_players
+                             if p.get("status", "active") in ["active", "substitute"]]
+        available_count = len(available_players)
+        meets_min = available_count >= min_players
 
         team_wins = 0
         team_losses = 0
@@ -908,28 +972,245 @@ def tournament_roster(ctx, tournament_id, region, team_status):
             form.append("胜" if my_s > opp_s else "负")
         form_str = " ".join(form) if form else "-"
 
+        status_tag = "✓ 满足" if meets_min else "✗ 不满足"
         print_info("")
         print_info(f"【{t.get('name', '')}】 ({t.get('short_name', '')})")
         print_info(f"  地区: {t.get('region', '-')} | 教练: {t.get('coach', '-')}")
         print_info(f"  战绩: {team_wins}胜 {team_losses}负 "
                    f"| 胜率: {calculate_win_rate(team_wins, team_losses)}")
         print_info(f"  近期走势: {form_str}")
-        print_info(f"  选手: {len(active_players)} 人注册，{suspended_count} 人禁赛")
+        print_info(f"  选手统计: 总计{total_players}人 | "
+                   f"正常{active_count} | 替补{substitute_count} | "
+                   f"禁赛{suspended_count} | 受伤{injured_count}")
+        print_info(f"  可出场: {available_count} 人 最低要求{min_players}人 -> {status_tag}")
 
-        if active_players:
-            print_info(f"  阵容:")
-            for p in active_players[:6]:
+        display_players = available_players if available_only else team_players
+        if display_players:
+            print_info(f"  阵容 ({'可出场' if available_only else '全部'}):")
+            for p in display_players[:6]:
                 stats = p.get("stats", {})
                 kills = stats.get("kills", 0)
                 deaths = stats.get("deaths", 0)
                 assists = stats.get("assists", 0)
                 kda = (kills + assists) / deaths if deaths > 0 else float(kills + assists)
+                p_status = status_map.get(p.get("status", "active"), p.get("status", "active"))
                 print_info(f"    {p.get('ingame_id', ''):<10} "
                            f"{p.get('name', ''):<6} "
                            f"{p.get('role', ''):<6} "
-                           f"KDA: {kda:.2f}")
-            if len(active_players) > 6:
-                print_info(f"    ... 还有 {len(active_players) - 6} 名选手")
+                           f"KDA: {kda:.2f} "
+                           f"[{p_status}]")
+            if len(display_players) > 6:
+                print_info(f"    ... 还有 {len(display_players) - 6} 名选手")
 
     print_info("")
     print_info("=" * 60)
+
+
+@tournament_cmd.command("stage-list")
+@click.argument("tournament_id")
+@pass_context
+def tournament_stage_list(ctx, tournament_id):
+    """查看赛事阶段列表"""
+    tournaments = ctx.db.load_tournaments()
+    tour = next((t for t in tournaments if t.get("id") == tournament_id), None)
+    if not tour:
+        print_error(f"未找到赛事: {tournament_id}")
+        return
+
+    stages = tour.get("stages", [])
+
+    if not stages:
+        print_info("该赛事暂无阶段配置")
+        return
+
+    rows = []
+    for i, s in enumerate(stages, 1):
+        teams = s.get("teams", [])
+        team_count = len(teams) if teams else "(继承赛事)"
+        rows.append([
+            str(i),
+            s.get("id", "-"),
+            s.get("name", "-"),
+            s.get("start_date", "-"),
+            s.get("end_date", "-"),
+            f"BO{s.get('bo', 3)}",
+            str(team_count),
+        ])
+
+    print_table(
+        f"赛事阶段 - {tour.get('name', tournament_id)}",
+        ["序号", "阶段ID", "阶段名称", "开始日期", "结束日期", "赛制", "参赛队数"],
+        rows,
+        table_style=ctx.table_style,
+    )
+
+
+@tournament_cmd.command("stage-add")
+@click.argument("tournament_id")
+@click.option("--stage-id", required=True, help="阶段ID")
+@click.option("--name", required=True, help="阶段名称")
+@click.option("--start-date", required=True, help="开始日期 (YYYY-MM-DD)")
+@click.option("--end-date", required=True, help="结束日期 (YYYY-MM-DD)")
+@click.option("--bo", type=int, default=3, help="赛制")
+@click.option("--teams", help="参赛队伍ID列表，逗号分隔；不填则继承赛事全部队伍")
+@pass_context
+def tournament_stage_add(ctx, tournament_id, stage_id, name, start_date, end_date, bo, teams):
+    """添加赛事阶段"""
+    from datetime import datetime
+
+    try:
+        datetime.strptime(start_date, "%Y-%m-%d")
+        datetime.strptime(end_date, "%Y-%m-%d")
+    except ValueError:
+        print_error("日期格式错误，请使用 YYYY-MM-DD")
+        return
+
+    if start_date > end_date:
+        print_error("开始日期不能晚于结束日期")
+        return
+
+    tournaments = ctx.db.load_tournaments()
+    tour = next((t for t in tournaments if t.get("id") == tournament_id), None)
+    if not tour:
+        print_error(f"未找到赛事: {tournament_id}")
+        return
+
+    stages = tour.get("stages", [])
+    if any(s.get("id") == stage_id for s in stages):
+        print_error(f"阶段ID已存在: {stage_id}")
+        return
+
+    tour_teams = set(tour.get("teams", []))
+    stage_teams = None
+    if teams:
+        stage_teams = [t.strip() for t in teams.split(",") if t.strip()]
+        all_teams = {t["id"] for t in ctx.db.load_teams()}
+        invalid = [t for t in stage_teams if t not in all_teams]
+        if invalid:
+            print_error(f"以下队伍不存在: {', '.join(invalid)}")
+            return
+        not_in_tour = [t for t in stage_teams if t not in tour_teams]
+        if not_in_tour:
+            print_error(f"以下队伍不在参赛名单中: {', '.join(not_in_tour)}")
+            return
+
+    new_stage = {
+        "id": stage_id,
+        "name": name,
+        "start_date": start_date,
+        "end_date": end_date,
+        "bo": bo,
+    }
+    if stage_teams:
+        new_stage["teams"] = stage_teams
+
+    stages.append(new_stage)
+    tour["stages"] = stages
+    ctx.db.save_tournaments(tournaments)
+
+    print_success(f"已添加阶段: {name} ({stage_id})")
+    print_info(f"  时间: {start_date} ~ {end_date}")
+    print_info(f"  赛制: BO{bo}")
+    if stage_teams:
+        print_info(f"  参赛队伍: {len(stage_teams)} 支")
+    else:
+        print_info("  参赛队伍: 继承赛事全部队伍")
+
+
+@tournament_cmd.command("stage-edit")
+@click.argument("tournament_id")
+@click.argument("stage_id")
+@click.option("--name", help="阶段名称")
+@click.option("--start-date", help="开始日期")
+@click.option("--end-date", help="结束日期")
+@click.option("--bo", type=int, help="赛制")
+@click.option("--teams", help="参赛队伍ID列表，逗号分隔")
+@pass_context
+def tournament_stage_edit(ctx, tournament_id, stage_id, name, start_date, end_date, bo, teams):
+    """修改赛事阶段"""
+    from datetime import datetime
+
+    tournaments = ctx.db.load_tournaments()
+    tour = next((t for t in tournaments if t.get("id") == tournament_id), None)
+    if not tour:
+        print_error(f"未找到赛事: {tournament_id}")
+        return
+
+    stages = tour.get("stages", [])
+    stage = next((s for s in stages if s.get("id") == stage_id), None)
+    if not stage:
+        print_error(f"未找到阶段: {stage_id}")
+        return
+
+    if start_date:
+        try:
+            datetime.strptime(start_date, "%Y-%m-%d")
+        except ValueError:
+            print_error("日期格式错误，请使用 YYYY-MM-DD")
+            return
+
+    if end_date:
+        try:
+            datetime.strptime(end_date, "%Y-%m-%d")
+        except ValueError:
+            print_error("日期格式错误，请使用 YYYY-MM-DD")
+            return
+
+    sd = start_date or stage.get("start_date")
+    ed = end_date or stage.get("end_date")
+    if sd > ed:
+        print_error("开始日期不能晚于结束日期")
+        return
+
+    tour_teams = set(tour.get("teams", []))
+    if teams is not None:
+        if teams == "":
+            stage.pop("teams", None)
+        else:
+            stage_teams = [t.strip() for t in teams.split(",") if t.strip()]
+            all_teams = {t["id"] for t in ctx.db.load_teams()}
+            invalid = [t for t in stage_teams if t not in all_teams]
+            if invalid:
+                print_error(f"以下队伍不存在: {', '.join(invalid)}")
+                return
+            not_in_tour = [t for t in stage_teams if t not in tour_teams]
+            if not_in_tour:
+                print_error(f"以下队伍不在参赛名单中: {', '.join(not_in_tour)}")
+                return
+            stage["teams"] = stage_teams
+
+    if name:
+        stage["name"] = name
+    if start_date:
+        stage["start_date"] = start_date
+    if end_date:
+        stage["end_date"] = end_date
+    if bo is not None:
+        stage["bo"] = bo
+
+    ctx.db.save_tournaments(tournaments)
+    print_success(f"已更新阶段: {stage.get('name', stage_id)}")
+
+
+@tournament_cmd.command("stage-remove")
+@click.argument("tournament_id")
+@click.argument("stage_id")
+@pass_context
+def tournament_stage_remove(ctx, tournament_id, stage_id):
+    """删除赛事阶段"""
+    tournaments = ctx.db.load_tournaments()
+    tour = next((t for t in tournaments if t.get("id") == tournament_id), None)
+    if not tour:
+        print_error(f"未找到赛事: {tournament_id}")
+        return
+
+    stages = tour.get("stages", [])
+    stage = next((s for s in stages if s.get("id") == stage_id), None)
+    if not stage:
+        print_error(f"未找到阶段: {stage_id}")
+        return
+
+    stages[:] = [s for s in stages if s.get("id") != stage_id]
+    tour["stages"] = stages
+    ctx.db.save_tournaments(tournaments)
+    print_success(f"已删除阶段: {stage.get('name', stage_id)}")

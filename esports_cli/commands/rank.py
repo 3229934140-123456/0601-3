@@ -215,8 +215,47 @@ def rank_standings(ctx, tournament, sort_by, tiebreaker):
                     return -1 if a_val < b_val else 1
         return 0
 
+    def get_deciding_rule(a, b):
+        """判断两支队伍是由哪条规则区分出名次的，返回规则名"""
+        a_primary = build_sort_key(a)
+        b_primary = build_sort_key(b)
+        if a_primary != b_primary:
+            return sort_by
+
+        for rule in tb_rules:
+            if rule == "h2h":
+                a_h2h = a["h2h"].get(b["team_id"], {"wins": 0, "losses": 0})
+                a_w = a_h2h["wins"]
+                a_l = a_h2h["losses"]
+                b_w = a_l
+                if a_w != b_w:
+                    return "h2h"
+            else:
+                a_val = get_tb_value(a, rule)
+                b_val = get_tb_value(b, rule)
+                if a_val != b_val:
+                    return rule
+        return "并列"
+
     import functools
     standings.sort(key=functools.cmp_to_key(compare_teams))
+
+    rule_names = {
+        "points": "积分",
+        "wins": "胜场",
+        "win_rate": "胜率",
+        "net_score": "净胜分",
+        "map_diff": "净胜图",
+        "h2h": "直接交手",
+    }
+
+    deciding_rules = []
+    for i in range(len(standings)):
+        if i == 0:
+            deciding_rules.append("-")
+        else:
+            rule = get_deciding_rule(standings[i-1], standings[i])
+            deciding_rules.append(rule_names.get(rule, rule))
 
     rows = []
     for i, s in enumerate(standings, 1):
@@ -238,7 +277,11 @@ def rank_standings(ctx, tournament, sort_by, tiebreaker):
             reason_parts.append(f"{s['wins']}胜")
         if "net_score" in tb_rules:
             reason_parts.append(f"净胜分{s['net_score']:+d}")
+        if "h2h" in tb_rules:
+            reason_parts.append(f"直接交手")
         reason = " | ".join(reason_parts)
+
+        dr = deciding_rules[i-1] if i-1 < len(deciding_rules) else "-"
 
         rows.append([
             rank_display,
@@ -252,17 +295,20 @@ def rank_standings(ctx, tournament, sort_by, tiebreaker):
             str(s["score_against"]),
             f"{s['net_score']:+d}",
             str(s["points"]),
+            dr,
             reason,
         ])
 
     print_table(
         f"积分榜 - {tour_name}",
-        ["排名", "队伍", "胜", "负", "胜率", "地图胜-负", "净胜图", "得分", "失分", "净胜分", "积分", "排名依据"],
+        ["排名", "队伍", "胜", "负", "胜率", "地图胜-负", "净胜图", "得分", "失分", "净胜分", "积分", "区分规则", "排名依据"],
         rows,
         table_style=ctx.table_style,
     )
     print_info(f"共 {len(standings)} 支队伍")
-    print_info(f"排序规则: 主规则={sort_by}, 并列规则={tiebreaker}")
+    print_info(f"排序规则: 主规则={rule_names.get(sort_by, sort_by)}")
+    print_info(f"并列规则: {' → '.join(rule_names.get(r, r) for r in tb_rules)}")
+    print_info("区分规则: 与上一名队伍比较时，起决定性作用的规则")
 
 
 @rank_cmd.command("win-rate")

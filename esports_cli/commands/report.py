@@ -17,6 +17,7 @@ from esports_cli.utils import (
     calculate_win_rate,
     validate_datetime,
     console,
+    log_operation,
 )
 
 
@@ -31,9 +32,12 @@ def report_cmd():
 @click.option("--format", "-f", "output_format", default="text",
               type=click.Choice(["text", "md", "json"]),
               help="输出格式")
+@click.option("--compare-depth", "-d", default="3",
+              type=click.Choice(["3", "5", "all"]),
+              help="核心选手对比数量：3人/5人/全部首发")
 @click.option("--output", "-o", default="", help="输出文件路径")
 @pass_context
-def report_match(ctx, match_id, output_format, output):
+def report_match(ctx, match_id, output_format, compare_depth, output):
     """生成单场比赛战报"""
     matches = ctx.db.load_matches()
     teams_list = ctx.db.load_teams()
@@ -82,7 +86,9 @@ def report_match(ctx, match_id, output_format, output):
         ps = get_team_players(team_id)
         ps.sort(key=lambda p: -(p.get("stats", {}).get("kills", 0)
                                   + p.get("stats", {}).get("assists", 0)))
-        return ps[:3]
+        if compare_depth == "all":
+            return ps
+        return ps[:int(compare_depth)]
 
     team_a_players = get_team_players(ta_id)
     team_b_players = get_team_players(tb_id)
@@ -356,39 +362,35 @@ def _generate_match_report_md(match_data, team_a, team_b, tour,
 
     lines.append("## 核心选手 KDA 对比")
     lines.append("")
-    lines.append(f"| {team_a.get('name', 'A')} | 角色 | KDA | | {team_b.get('name', 'B')} | 角色 | KDA |")
-    lines.append(f"|{'------' * 3}| |{'------' * 3}|")
-    max_players = max(len(team_a_core), len(team_b_core))
-    for i in range(max_players):
-        pa = team_a_core[i] if i < len(team_a_core) else None
-        pb = team_b_core[i] if i < len(team_b_core) else None
-        if pa:
-            stats_a = pa.get("stats", {})
-            ka = stats_a.get("kills", 0)
-            da = stats_a.get("deaths", 0)
-            aa = stats_a.get("assists", 0)
-            kda_a = (ka + aa) / da if da > 0 else float(ka + aa)
-            a_name = pa.get("ingame_id", "")
-            a_role = pa.get("role", "")
-            a_kda = f"{kda_a:.2f}"
-        else:
-            a_name = "-"
-            a_role = "-"
-            a_kda = "-"
-        if pb:
-            stats_b = pb.get("stats", {})
-            kb = stats_b.get("kills", 0)
-            db = stats_b.get("deaths", 0)
-            ab = stats_b.get("assists", 0)
-            kda_b = (kb + ab) / db if db > 0 else float(kb + ab)
-            b_name = pb.get("ingame_id", "")
-            b_role = pb.get("role", "")
-            b_kda = f"{kda_b:.2f}"
-        else:
-            b_name = "-"
-            b_role = "-"
-            b_kda = "-"
-        lines.append(f"| {a_name} | {a_role} | {a_kda} | | {b_name} | {b_role} | {b_kda} |")
+    lines.append(f"### {team_a.get('name', 'A')}")
+    lines.append("")
+    lines.append("| 游戏ID | 姓名 | 角色 | 击杀 | 死亡 | 助攻 | KDA |")
+    lines.append("|--------|------|------|------|------|------|-----|")
+    for p in team_a_core:
+        stats_a = p.get("stats", {})
+        ka = stats_a.get("kills", 0)
+        da = stats_a.get("deaths", 0)
+        aa = stats_a.get("assists", 0)
+        kda_a = (ka + aa) / da if da > 0 else float(ka + aa)
+        lines.append(f"| {p.get('ingame_id', '')} | {p.get('name', '')} | "
+                     f"{p.get('role', '')} | {ka} | {da} | {aa} | {kda_a:.2f} |")
+    if not team_a_core:
+        lines.append("| - | - | - | - | - | - | - |")
+    lines.append("")
+    lines.append(f"### {team_b.get('name', 'B')}")
+    lines.append("")
+    lines.append("| 游戏ID | 姓名 | 角色 | 击杀 | 死亡 | 助攻 | KDA |")
+    lines.append("|--------|------|------|------|------|------|-----|")
+    for p in team_b_core:
+        stats_b = p.get("stats", {})
+        kb = stats_b.get("kills", 0)
+        db = stats_b.get("deaths", 0)
+        ab = stats_b.get("assists", 0)
+        kda_b = (kb + ab) / db if db > 0 else float(kb + ab)
+        lines.append(f"| {p.get('ingame_id', '')} | {p.get('name', '')} | "
+                     f"{p.get('role', '')} | {kb} | {db} | {ab} | {kda_b:.2f} |")
+    if not team_b_core:
+        lines.append("| - | - | - | - | - | - | - |")
     lines.append("")
 
     lines.append("## 近期状态对比 (近5场)")
@@ -450,12 +452,15 @@ def _generate_match_report_md(match_data, team_a, team_b, tour,
 @click.option("--tournament", "-t", help="赛事ID")
 @click.option("--date-from", help="开始日期 (YYYY-MM-DD)")
 @click.option("--date-to", help="结束日期 (YYYY-MM-DD)")
+@click.option("--available-only", is_flag=True, help="只统计可出场选手")
+@click.option("--min-players", type=int, default=5, help="最低出场人数要求")
 @click.option("--format", "-f", "output_format", default="text",
               type=click.Choice(["text", "md", "json"]),
               help="输出格式")
 @click.option("--output", "-o", default="", help="输出文件路径")
 @pass_context
-def report_team(ctx, team_id, tournament, date_from, date_to, output_format, output):
+def report_team(ctx, team_id, tournament, date_from, date_to,
+                available_only, min_players, output_format, output):
     """生成队伍战绩报告"""
     teams = ctx.db.load_teams()
     matches = ctx.db.load_matches()
@@ -589,8 +594,21 @@ def report_team(ctx, team_id, tournament, date_from, date_to, output_format, out
     map_diff = map_wins - map_losses
 
     team_players = [p for p in players if p.get("team_id") == team_id]
-    player_stats = []
+
+    status_counts = {}
     for p in team_players:
+        s = p.get("status", "active")
+        status_counts[s] = status_counts.get(s, 0) + 1
+
+    available_players = [p for p in team_players
+                         if p.get("status", "active") in ["active", "substitute"]]
+    available_count = len(available_players)
+    meets_min = available_count >= min_players
+
+    display_players = available_players if available_only else team_players
+
+    player_stats = []
+    for p in display_players:
         stats = p.get("stats", {})
         kills = stats.get("kills", 0)
         deaths = stats.get("deaths", 0)
@@ -609,6 +627,18 @@ def report_team(ctx, team_id, tournament, date_from, date_to, output_format, out
         })
     player_stats.sort(key=lambda x: -x["kda"])
 
+    roster_info = {
+        "total": len(team_players),
+        "active": status_counts.get("active", 0),
+        "substitute": status_counts.get("substitute", 0),
+        "suspended": status_counts.get("suspended", 0),
+        "injured": status_counts.get("injured", 0),
+        "available": available_count,
+        "min_required": min_players,
+        "meets_minimum": meets_min,
+        "available_only": available_only,
+    }
+
     date_range_info = {
         "from": date_from,
         "to": date_to,
@@ -618,6 +648,7 @@ def report_team(ctx, team_id, tournament, date_from, date_to, output_format, out
         full_data = {
             "team": team_data,
             "date_range": date_range_info,
+            "roster": roster_info,
             "summary": {
                 "total_matches": total,
                 "wins": wins,
@@ -641,13 +672,13 @@ def report_team(ctx, team_id, tournament, date_from, date_to, output_format, out
                                            score_for, score_against, recent_form,
                                            opponent_stats, tournament_stats,
                                            player_stats, map_wins, map_losses, map_diff,
-                                           date_range_info, ctx.date_fmt)
+                                           date_range_info, roster_info, ctx.date_fmt)
     else:
         content = _generate_team_report_text(team_data, total, wins, losses, win_rate,
                                              score_for, score_against, recent_form,
                                              opponent_stats, tournament_stats,
                                              player_stats, map_wins, map_losses, map_diff,
-                                             date_range_info, ctx.date_fmt)
+                                             date_range_info, roster_info, ctx.date_fmt)
 
     if output:
         output_path = Path(output)
@@ -663,7 +694,7 @@ def _generate_team_report_text(team_data, total, wins, losses, win_rate,
                                score_for, score_against, recent_form,
                                opponent_stats, tournament_stats,
                                player_stats, map_wins, map_losses, map_diff,
-                               date_range_info, date_fmt):
+                               date_range_info, roster_info, date_fmt):
     lines = []
     lines.append("=" * 70)
     lines.append(f"队伍战绩报告: {team_data.get('name', '')}")
@@ -678,6 +709,17 @@ def _generate_team_report_text(team_data, total, wins, losses, win_rate,
     lines.append(f"总得分: {score_for}  总失分: {score_against}  净胜分: {score_for - score_against:+d}")
     lines.append(f"地图胜: {map_wins}  地图负: {map_losses}  净胜图: {map_diff:+d}")
     lines.append("")
+
+    if roster_info:
+        r = roster_info
+        meets = "✓ 满足" if r["meets_minimum"] else "✗ 不满足"
+        lines.append(f"阵容统计: 总计{r['total']}人 | "
+                     f"正常{r['active']} | 替补{r['substitute']} | "
+                     f"禁赛{r['suspended']} | 受伤{r['injured']}")
+        lines.append(f"可出场: {r['available']} 人 (最低要求 {r['min_required']} 人) -> {meets}")
+        if r.get("available_only"):
+            lines.append("  (仅显示可出场选手)")
+        lines.append("")
 
     lines.append("-" * 70)
     lines.append("最近战绩走势 (近10场):")
@@ -745,7 +787,7 @@ def _generate_team_report_md(team_data, total, wins, losses, win_rate,
                              score_for, score_against, recent_form,
                              opponent_stats, tournament_stats,
                              player_stats, map_wins, map_losses, map_diff,
-                             date_range_info, date_fmt):
+                             date_range_info, roster_info, date_fmt):
     lines = []
     lines.append(f"# 队伍战绩报告: {team_data.get('name', '')}")
     lines.append("")
@@ -769,6 +811,23 @@ def _generate_team_report_md(team_data, total, wins, losses, win_rate,
     lines.append(f"| 地图负 | {map_losses} |")
     lines.append(f"| 净胜图 | {map_diff:+d} |")
     lines.append("")
+
+    if roster_info:
+        r = roster_info
+        meets = "是" if r["meets_minimum"] else "否"
+        lines.append("## 阵容统计")
+        lines.append("")
+        lines.append("| 指标 | 数值 |")
+        lines.append("|------|------|")
+        lines.append(f"| 总人数 | {r['total']} |")
+        lines.append(f"| 正常 | {r['active']} |")
+        lines.append(f"| 替补 | {r['substitute']} |")
+        lines.append(f"| 禁赛 | {r['suspended']} |")
+        lines.append(f"| 受伤 | {r['injured']} |")
+        lines.append(f"| 可出场 | {r['available']} |")
+        lines.append(f"| 最低要求 | {r['min_required']} 人 |")
+        lines.append(f"| 是否满足最低要求 | {meets} |")
+        lines.append("")
 
     lines.append("## 最近战绩走势 (近10场)")
     lines.append("")
@@ -1006,7 +1065,20 @@ def _validate_import_data(ctx, data_type, data):
     }
 
     seen_ids = set()
+    id_indices = {}
     valid_items = []
+    duplicate_ids = set()
+
+    for idx, item in enumerate(data, 1):
+        item_id = item.get("id", "")
+        if item_id:
+            if item_id not in id_indices:
+                id_indices[item_id] = []
+            id_indices[item_id].append(idx)
+
+    for item_id, indices in id_indices.items():
+        if item_id not in existing_ids and len(indices) > 1:
+            duplicate_ids.add(item_id)
 
     for idx, item in enumerate(data, 1):
         item_id = item.get("id", "")
@@ -1023,12 +1095,13 @@ def _validate_import_data(ctx, data_type, data):
             results["errors"].append(f"第 {idx} 条 (ID: {item_id}): 已存在，跳过")
             continue
 
-        if item_id in seen_ids:
+        if item_id in duplicate_ids:
             results["failed"] += 1
             results["error_types"]["duplicate_in_file"] += 1
-            results["errors"].append(f"第 {idx} 条 (ID: {item_id}): 文件内重复 ID，拒绝导入")
+            dup_lines = ", ".join(f"第 {i} 条" for i in id_indices[item_id])
+            results["errors"].append(f"第 {idx} 条 (ID: {item_id}): 文件内重复 ID "
+                                    f"({dup_lines} 重复)，全部拒绝导入")
             continue
-        seen_ids.add(item_id)
 
         missing = [f for f in required_fields if not item.get(f)]
         if missing:
@@ -1117,8 +1190,9 @@ def _print_import_results(title, results, table_style):
               type=click.Choice(["json", "csv"]),
               help="输入文件格式")
 @click.option("--dry-run", is_flag=True, help="试运行，不实际保存")
+@click.option("--summary-json", is_flag=True, help="输出JSON格式的变更摘要")
 @pass_context
-def report_import(ctx, data_type, file_path, input_format, dry_run):
+def report_import(ctx, data_type, file_path, input_format, dry_run, summary_json):
     """批量导入数据"""
     data = _read_import_file(file_path, input_format)
     if data is None:
@@ -1141,6 +1215,36 @@ def report_import(ctx, data_type, file_path, input_format, dry_run):
         title += " (试运行)"
 
     _print_import_results(title, results, ctx.table_style)
+
+    new_count = results["success"]
+    skip_count = results["skipped"]
+    fail_count = results["failed"]
+    overwrite_count = 0
+    delete_count = 0
+
+    summary = {
+        "operation": "import",
+        "data_type": data_type,
+        "data_type_name": type_names.get(data_type, data_type),
+        "dry_run": dry_run,
+        "source_file": file_path,
+        "summary": {
+            "total": results["total"],
+            "new": new_count,
+            "overwrite": overwrite_count,
+            "skipped": skip_count,
+            "failed": fail_count,
+            "deleted": delete_count,
+        },
+        "error_types": results["error_types"],
+        "errors": results["errors"],
+        "new_ids": [item.get("id") for item in valid_items],
+    }
+
+    if summary_json:
+        print_info("")
+        print_info("=== JSON 变更摘要 ===")
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
 
     if not dry_run and valid_items:
         save_map = {
@@ -1180,6 +1284,11 @@ def report_import(ctx, data_type, file_path, input_format, dry_run):
                     match_item.setdefault("type", "official")
                     matches.append(match_item)
             ctx.db.save_matches(matches)
+
+        settings = ctx.db.load_settings()
+        new_ids = [item.get("id") for item in valid_items]
+        detail = f"导入 {len(valid_items)} 条 {data_type}，来自 {file_path}"
+        log_operation(ctx.db, settings, "import", data_type, new_ids, detail)
 
         print_success("")
         print_success(f"导入完成，成功 {results['success']} 条。")
@@ -1360,8 +1469,9 @@ def report_backup(ctx, output):
               help="只恢复指定类型的数据")
 @click.option("--dry-run", is_flag=True, help="试运行，显示恢复预览")
 @click.option("--yes", "-y", is_flag=True, help="跳过确认，直接恢复")
+@click.option("--summary-json", is_flag=True, help="输出JSON格式的变更摘要")
 @pass_context
-def report_restore(ctx, backup_file, restore_type, dry_run, yes):
+def report_restore(ctx, backup_file, restore_type, dry_run, yes, summary_json):
     """从备份文件恢复数据"""
     import json
 
@@ -1399,35 +1509,89 @@ def report_restore(ctx, backup_file, restore_type, dry_run, yes):
             print_error(f"备份文件中不包含 {type_names.get(restore_type, restore_type)} 数据")
             return
 
+    per_type_stats = []
     rows = []
+    total_new = 0
+    total_overwrite = 0
+    total_delete = 0
+
     for t in target_types:
         current_count = 0
+        current_ids = set()
         load_func = getattr(ctx.db, f"load_{t}", None)
         if load_func:
             current = load_func()
             if isinstance(current, list):
                 current_count = len(current)
+                current_ids = {item.get("id") for item in current if item.get("id")}
             elif isinstance(current, dict):
                 current_count = len(current)
 
         new_data = data[t]
         new_count = len(new_data) if isinstance(new_data, (list, dict)) else 1
+
+        new_ids = set()
+        if isinstance(new_data, list):
+            new_ids = {item.get("id") for item in new_data if item.get("id")}
+        elif isinstance(new_data, dict):
+            new_ids = set(new_data.keys())
+
+        overwrite_count = len(current_ids & new_ids)
+        new_only_count = len(new_ids - current_ids)
+        delete_count = len(current_ids - new_ids)
+
+        total_new += new_only_count
+        total_overwrite += overwrite_count
+        total_delete += delete_count
+
+        op = "替换" if new_count > 0 else "清空"
         rows.append([
             type_names.get(t, t),
             str(current_count),
             str(new_count),
-            "替换" if new_count > 0 else "清空",
+            f"+{new_only_count}/={overwrite_count}/-{delete_count}",
+            op,
         ])
+
+        per_type_stats.append({
+            "type": t,
+            "type_name": type_names.get(t, t),
+            "current_count": current_count,
+            "backup_count": new_count,
+            "new": new_only_count,
+            "overwrite": overwrite_count,
+            "deleted": delete_count,
+        })
 
     print_table(
         f"恢复预览 - {backup_file}",
-        ["数据类型", "当前数量", "备份数量", "操作"],
+        ["数据类型", "当前数量", "备份数量", "新增/覆盖/删除", "操作"],
         rows,
         table_style=ctx.table_style,
     )
 
     print_info(f"备份版本: v{version}")
     print_info(f"创建时间: {created_at}")
+    print_info(f"变更汇总: 新增 {total_new} 条，覆盖 {total_overwrite} 条，删除 {total_delete} 条")
+
+    if summary_json:
+        summary = {
+            "operation": "restore",
+            "backup_file": backup_file,
+            "backup_version": version,
+            "backup_created_at": created_at,
+            "restore_type": restore_type,
+            "dry_run": dry_run,
+            "summary": {
+                "new": total_new,
+                "overwrite": total_overwrite,
+                "deleted": total_delete,
+            },
+            "per_type": per_type_stats,
+        }
+        print_info("")
+        print_info("=== JSON 变更摘要 ===")
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
 
     if dry_run:
         print_info("")
@@ -1455,8 +1619,111 @@ def report_restore(ctx, backup_file, restore_type, dry_run, yes):
             _, save_func = save_map[t]
             save_func(data[t])
 
+    settings = ctx.db.load_settings()
+    detail = f"恢复 {len(target_types)} 类数据，备份: {backup_file}, 类型: {restore_type}"
+    log_operation(ctx.db, settings, "restore", "system", target_types, detail)
+
     print_success("")
     print_success(f"数据恢复完成！已恢复 {len(target_types)} 类数据。")
+
+
+@report_cmd.command("logs")
+@click.option("--account", "-A", default="", help="按账号筛选")
+@click.option("--data-type", "-d", "data_type", default="", help="按数据类型筛选")
+@click.option("--operation", "-o", default="", help="按操作类型筛选")
+@click.option("--since", default="", help="起始时间 (YYYY-MM-DD)")
+@click.option("--until", default="", help="截止时间 (YYYY-MM-DD)")
+@click.option("--limit", "-n", type=int, default=50, help="显示条数 (默认50)")
+@click.option("--output", "-O", "output_path", default="", help="导出到文件 (.md 或 .json)")
+@pass_context
+def report_logs(ctx, account, data_type, operation, since, until, limit, output_path):
+    """查看操作日志（支持筛选和导出）"""
+    logs = ctx.db.load_operation_logs()
+
+    if account:
+        logs = [l for l in logs if l.get("account") == account or account in l.get("account_name", "")]
+    if data_type:
+        logs = [l for l in logs if l.get("data_type") == data_type]
+    if operation:
+        logs = [l for l in logs if l.get("operation") == operation]
+    if since:
+        logs = [l for l in logs if l.get("timestamp", "") >= since]
+    if until:
+        until_full = until + " 23:59:59"
+        logs = [l for l in logs if l.get("timestamp", "") <= until_full]
+
+    logs = list(reversed(logs))
+
+    if limit and limit > 0:
+        logs = logs[:limit]
+
+    if not logs:
+        print_info("暂无符合条件的操作日志")
+        return
+
+    if output_path:
+        output_path = os.path.abspath(output_path)
+        if output_path.endswith(".json"):
+            with open(output_path, "w", encoding="utf-8") as f:
+                json.dump(logs, f, ensure_ascii=False, indent=2)
+            print_success(f"日志已导出到 {output_path} ({len(logs)} 条)")
+        elif output_path.endswith(".md"):
+            md_content = _generate_logs_markdown(logs)
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write(md_content)
+            print_success(f"日志已导出到 {output_path} ({len(logs)} 条)")
+        else:
+            print_error("只支持 .json 或 .md 格式")
+        return
+
+    rows = []
+    for log in logs:
+        data_ids = log.get("data_ids", [])
+        id_str = ", ".join(str(x) for x in data_ids[:3])
+        if len(data_ids) > 3:
+            id_str += f" 等{len(data_ids)}条"
+        rows.append([
+            log.get("id", "-"),
+            log.get("timestamp", "-"),
+            log.get("account_name", log.get("account", "-")),
+            log.get("operation", "-"),
+            log.get("data_type", "-"),
+            id_str or "-",
+            log.get("details", "")[:40],
+        ])
+
+    print_table(
+        "操作日志",
+        ["日志ID", "时间", "账号", "操作", "数据类型", "数据ID", "详情"],
+        rows,
+        table_style=ctx.table_style,
+    )
+    print_info(f"共 {len(logs)} 条记录")
+
+
+def _generate_logs_markdown(logs):
+    lines = []
+    lines.append("# 操作日志\n")
+    lines.append(f"**总记录数**: {len(logs)}\n")
+    lines.append("## 日志列表\n")
+    lines.append("| 日志ID | 时间 | 账号 | 操作 | 数据类型 | 数据ID | 详情 |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- |")
+
+    for log in logs:
+        data_ids = log.get("data_ids", [])
+        id_str = ", ".join(str(x) for x in data_ids)
+        details = (log.get("details", "") or "").replace("|", "\\|")
+        lines.append(
+            f"| {log.get('id', '-')} "
+            f"| {log.get('timestamp', '-')} "
+            f"| {log.get('account_name', log.get('account', '-'))} "
+            f"| {log.get('operation', '-')} "
+            f"| {log.get('data_type', '-')} "
+            f"| {id_str} "
+            f"| {details} |"
+        )
+
+    return "\n".join(lines) + "\n"
 
 
 @report_cmd.command("reminders")

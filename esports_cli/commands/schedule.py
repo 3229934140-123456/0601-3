@@ -14,6 +14,8 @@ from esports_cli.utils import (
     validate_datetime,
     check_tournament_exists,
     check_team_exists,
+    validate_match_for_stage,
+    log_operation,
 )
 
 
@@ -118,7 +120,7 @@ def schedule_list(ctx, tournament, date, team, upcoming, past):
 @click.option("--team-a", "-a", required=True, help="队伍A ID")
 @click.option("--team-b", "-b", required=True, help="队伍B ID")
 @click.option("--datetime", "-d", "datetime_str", required=True, help="比赛时间 (YYYY-MM-DD HH:MM)")
-@click.option("--stage", "-s", default="常规赛", help="比赛阶段")
+@click.option("--stage", "-s", default="", help="比赛阶段（指定时自动校验）")
 @click.option("--bo", default=3, type=int, help="BO几")
 @pass_context
 def schedule_add(ctx, tournament, team_a, team_b, datetime_str, stage, bo):
@@ -149,6 +151,14 @@ def schedule_add(ctx, tournament, team_a, team_b, datetime_str, stage, bo):
         print_info("请使用格式: YYYY-MM-DD HH:MM 或 YYYY/MM/DD HH:MM")
         return
 
+    if stage:
+        valid_stage, stage_err = validate_match_for_stage(
+            tour_info, stage, date_part, team_a, team_b
+        )
+        if not valid_stage:
+            print_error(f"阶段校验失败: {stage_err}")
+            return
+
     match_id = generate_id("M")
     schedule = {
         "id": match_id,
@@ -178,6 +188,10 @@ def schedule_add(ctx, tournament, team_a, team_b, datetime_str, stage, bo):
 
     ctx.db.save_schedules(schedules)
     ctx.db.save_matches(matches)
+
+    settings = ctx.db.load_settings()
+    log_operation(ctx.db, settings, "create", "schedule", [match_id],
+                  f"{team_a_info.get('name')} vs {team_b_info.get('name')}, BO{bo}, {stage}")
 
     print_success(f"赛程已添加: {match_id}")
     print_info(f"对阵: {team_a_info.get('name')} vs {team_b_info.get('name')}")
@@ -256,6 +270,21 @@ def schedule_edit(ctx, schedule_id, datetime, stage, bo, team_a, team_b, tournam
         print_info("可用选项: --datetime, --stage, --bo, --team-a, --team-b, --tournament")
         return
 
+    final_tour_id = updates.get("tournament_id", sched_data.get("tournament_id"))
+    final_stage = updates.get("stage", sched_data.get("stage", ""))
+    final_date = updates.get("date", sched_data.get("date", ""))
+    final_team_a = updates.get("team_a_id", sched_data.get("team_a_id", ""))
+    final_team_b = updates.get("team_b_id", sched_data.get("team_b_id", ""))
+
+    if final_stage:
+        final_tour = tour_map.get(final_tour_id)
+        valid_stage, stage_err = validate_match_for_stage(
+            final_tour, final_stage, final_date, final_team_a, final_team_b
+        )
+        if not valid_stage:
+            print_error(f"阶段校验失败: {stage_err}")
+            return
+
     for key, value in updates.items():
         sched_data[key] = value
 
@@ -277,6 +306,10 @@ def schedule_edit(ctx, schedule_id, datetime, stage, bo, team_a, team_b, tournam
                 match_data[f] = updates[f]
         matches[match_idx] = match_data
         ctx.db.save_matches(matches)
+
+    settings = ctx.db.load_settings()
+    detail_str = ", ".join(f"{k}={v}" for k, v in updates.items())
+    log_operation(ctx.db, settings, "edit", "schedule", [schedule_id], detail_str)
 
     print_success(f"赛程已更新: {schedule_id}")
     for key, value in updates.items():

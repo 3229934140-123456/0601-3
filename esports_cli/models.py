@@ -17,6 +17,7 @@ class DataManager:
             "schedules.json",
             "scrims.json",
             "reminders.json",
+            "operation_logs.json",
         ]
         for f in files:
             filepath = os.path.join(self.data_dir, f)
@@ -84,6 +85,12 @@ class DataManager:
 
     def save_reminders(self, data):
         save_json(os.path.join(self.data_dir, "reminders.json"), data)
+
+    def load_operation_logs(self):
+        return load_json(os.path.join(self.data_dir, "operation_logs.json"))
+
+    def save_operation_logs(self, data):
+        save_json(os.path.join(self.data_dir, "operation_logs.json"), data)
 
     def load_settings(self):
         return load_json(os.path.join(self.config_dir, "settings.json"), default={})

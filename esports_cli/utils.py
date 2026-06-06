@@ -207,3 +207,81 @@ def check_team_exists(teams, team_id):
         if t.get("id") == team_id:
             return True, t
     return False, None
+
+
+def get_tournament_stage(tournament, stage_id):
+    """获取赛事的指定阶段"""
+    if not tournament or not stage_id:
+        return None
+    stages = tournament.get("stages", [])
+    for s in stages:
+        if s.get("id") == stage_id:
+            return s
+    return None
+
+
+def validate_match_for_stage(tournament, stage_id, match_date, team_a_id, team_b_id):
+    """校验比赛/赛程是否符合阶段配置，返回 (valid, error_msg)"""
+    if not stage_id:
+        return True, ""
+
+    stage = get_tournament_stage(tournament, stage_id)
+    if not stage:
+        return False, f"阶段不存在: {stage_id}"
+
+    if match_date:
+        from datetime import datetime
+        try:
+            if isinstance(match_date, str):
+                if "T" in match_date or " " in match_date:
+                    dt = datetime.strptime(match_date[:10], "%Y-%m-%d")
+                else:
+                    dt = datetime.strptime(match_date, "%Y-%m-%d")
+            else:
+                dt = match_date
+            match_d = dt.strftime("%Y-%m-%d")
+        except (ValueError, TypeError):
+            return False, f"日期格式无效: {match_date}"
+
+        start = stage.get("start_date", "")
+        end = stage.get("end_date", "")
+        if start and match_d < start:
+            return False, f"比赛日期 {match_d} 早于阶段开始日期 {start}"
+        if end and match_d > end:
+            return False, f"比赛日期 {match_d} 晚于阶段结束日期 {end}"
+
+    stage_teams = stage.get("teams")
+    if stage_teams is not None:
+        stage_team_set = set(stage_teams)
+        if team_a_id and team_a_id not in stage_team_set:
+            return False, f"队伍 {team_a_id} 不在阶段参赛名单中"
+        if team_b_id and team_b_id not in stage_team_set:
+            return False, f"队伍 {team_b_id} 不在阶段参赛名单中"
+
+    return True, ""
+
+
+def log_operation(db, settings, operation, data_type, data_ids, details=None):
+    """记录操作日志"""
+    from datetime import datetime
+    logs = db.load_operation_logs()
+
+    account = settings.get("current_account", "default")
+    accounts = settings.get("accounts", {})
+    account_info = accounts.get(account, {})
+    account_name = account_info.get("name", account)
+
+    log_entry = {
+        "id": f"LOG{len(logs) + 1:06d}",
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "account": account,
+        "account_name": account_name,
+        "operation": operation,
+        "data_type": data_type,
+        "data_ids": data_ids if isinstance(data_ids, list) else [data_ids],
+        "details": details or "",
+    }
+
+    logs.append(log_entry)
+    db.save_operation_logs(logs)
+    return log_entry
